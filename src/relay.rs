@@ -223,3 +223,109 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    fn state(value: i32) -> Snapshot {
+        let mut axes = [InputAbsInfo::default(); 18];
+        for code in AXES {
+            axes[code as usize] = InputAbsInfo {
+                minimum: 0,
+                maximum: 255,
+                value,
+                ..Default::default()
+            };
+        }
+        Snapshot {
+            axes,
+            keys: [0; 96],
+        }
+    }
+    fn event(code: u16) -> InputEvent {
+        InputEvent {
+            time: unsafe { std::mem::zeroed() },
+            kind: EV_SYN,
+            code,
+            value: 0,
+        }
+    }
+
+    #[test]
+    fn startup_stops_at_each_possible_output_failure() {
+        for fail_at in 0..20 {
+            let mut calls = 0;
+            let error = Relay::new(state(0), &mut |_, _, _| {
+                calls += 1;
+                if calls == fail_at + 1 {
+                    Err(io::Error::from_raw_os_error(libc::ENODEV))
+                } else {
+                    Ok(())
+                }
+            })
+            .err()
+            .expect("failure must propagate");
+            assert_eq!(calls, fail_at + 1);
+            assert_eq!(error.raw_os_error(), Some(libc::ENODEV));
+        }
+    }
+
+    #[test]
+    fn failed_publication_keeps_recovery_mode_until_a_complete_snapshot() {
+        for fail_at in 0..20 {
+            let mut relay = Relay::new(state(0), &mut |_, _, _| Ok(())).unwrap();
+            relay
+                .process(
+                    event(SYN_DROPPED),
+                    &mut || panic!(),
+                    &mut |_, _, _| panic!(),
+                )
+                .unwrap();
+            let mut calls = 0;
+            assert!(relay
+                .process(event(SYN_REPORT), &mut || Ok(state(255)), &mut |_, _, _| {
+                    calls += 1;
+                    if calls == fail_at + 1 {
+                        Err(io::Error::other("write failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err());
+            assert_eq!(calls, fail_at + 1);
+            let input = InputEvent {
+                kind: EV_KEY,
+                code: BTN_SOUTH,
+                value: 1,
+                ..event(0)
+            };
+            relay
+                .process(input, &mut || panic!(), &mut |_, _, _| {
+                    panic!("must discard stale events")
+                })
+                .unwrap();
+            let mut published = Vec::new();
+            relay
+                .process(event(SYN_REPORT), &mut || Ok(state(255)), &mut |k, c, v| {
+                    published.push((k, c, v));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(published.len(), 20);
+            assert!(published.contains(&(EV_ABS, ABS_X, 32767)));
+            assert!(!relay.dropped);
+        }
+    }
+
+    #[test]
+    fn normal_output_errors_propagate_without_querying_state() {
+        let mut relay = Relay::new(state(0), &mut |_, _, _| Ok(())).unwrap();
+        let error = relay
+            .process(event(SYN_REPORT), &mut || panic!(), &mut |_, _, _| {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            })
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+}
