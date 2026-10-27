@@ -166,7 +166,7 @@ pub(crate) struct UinputFfErase {
 
 /// Issue an integer-valued ioctl, preserving the kernel error.
 pub(crate) fn ioctl_val(fd: RawFd, req: libc::c_ulong, val: i32) -> io::Result<()> {
-    let r = unsafe { libc::ioctl(fd, req, val) };
+    let r = retry_interrupted(|| unsafe { libc::ioctl(fd, req, val) } as isize) as libc::c_int;
     if r < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -177,7 +177,8 @@ pub(crate) fn ioctl_val(fd: RawFd, req: libc::c_ulong, val: i32) -> io::Result<(
 /// Issue an ioctl with its matching C-layout payload.
 pub(crate) fn ioctl_ref<T>(fd: RawFd, req: libc::c_ulong, v: &mut T) -> io::Result<()> {
     // Call sites pair each request with its matching repr(C) payload.
-    let r = unsafe { libc::ioctl(fd, req, v as *mut T) };
+    let r =
+        retry_interrupted(|| unsafe { libc::ioctl(fd, req, v as *mut T) } as isize) as libc::c_int;
     if r < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -189,13 +190,13 @@ pub(crate) fn ioctl_ref<T>(fd: RawFd, req: libc::c_ulong, v: &mut T) -> io::Resu
 pub(crate) fn read_event(fd: RawFd) -> io::Result<InputEvent> {
     let mut ev: InputEvent = unsafe { zeroed() };
     // InputEvent contains only integer fields; the buffer is valid for its full size.
-    let n = unsafe {
+    let n = retry_interrupted(|| unsafe {
         libc::read(
             fd,
             &mut ev as *mut _ as *mut libc::c_void,
             size_of::<InputEvent>(),
         )
-    };
+    });
     if n == size_of::<InputEvent>() as isize {
         Ok(ev)
     } else if n < 0 {
@@ -216,17 +217,22 @@ pub(crate) fn write_event(fd: RawFd, kind: u16, code: u16, value: i32) -> io::Re
         code,
         value,
     };
-    let n = unsafe {
+    let n = retry_interrupted(|| unsafe {
         libc::write(
             fd,
             &ev as *const _ as *const libc::c_void,
             size_of::<InputEvent>(),
         )
-    };
+    });
     if n == size_of::<InputEvent>() as isize {
         Ok(())
-    } else {
+    } else if n < 0 {
         Err(io::Error::last_os_error())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "incomplete input event write",
+        ))
     }
 }
 
@@ -321,5 +327,40 @@ mod layout_tests {
     fn event_and_effect_sizes_match_linux() {
         assert_eq!(size_of::<InputEvent>(), 24);
         assert_eq!(size_of::<FfEffect>(), 48);
+    }
+}
+
+/// Retry only operations that transferred no bytes when interrupted.
+fn retry_interrupted(mut operation: impl FnMut() -> isize) -> isize {
+    loop {
+        let result = operation();
+        if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return result;
+        }
+    }
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    use super::*;
+
+    #[test]
+    fn retries_interruptions_but_preserves_other_failures_and_short_results() {
+        for final_result in [-1, 0, 3, size_of::<InputEvent>() as isize] {
+            let mut calls = 0;
+            let result = retry_interrupted(|| {
+                calls += 1;
+                unsafe {
+                    *libc::__errno_location() = if calls < 3 { libc::EINTR } else { libc::EBADF };
+                }
+                if calls < 3 {
+                    -1
+                } else {
+                    final_result
+                }
+            });
+            assert_eq!(result, final_result);
+            assert_eq!(calls, 3);
+        }
     }
 }
