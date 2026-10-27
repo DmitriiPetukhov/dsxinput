@@ -44,13 +44,13 @@ Make sure `~/.local/bin` is in your `PATH` to use the commands below.
 
 ### On its own
 
-Connect your DualSense over USB or Bluetooth, then launch a game:
+Launch a game with or without a DualSense connected:
 
 ```sh
 dsxinput /path/to/game --fullscreen
 ```
 
-Arguments after the game command are passed through unchanged.
+Arguments after the game command are passed through unchanged. You can connect your DualSense over USB or Bluetooth before or during the game.
 
 ### With GameMode and MangoHud
 
@@ -72,8 +72,14 @@ Replace `/home/your-user` with your home directory. Faugus adds the game command
 
 ## How it works
 
-Before launching the game, dsxinput detects a DualSense controller, takes exclusive access to its evdev input, and creates a virtual Xbox 360-style controller through Linux's `uinput` interface. It translates buttons, sticks, the D-pad, and triggers, and forwards standard rumble effects back to the DualSense.
+dsxinput launches the game even when no controller is connected. When it detects an accessible DualSense, it takes exclusive access to its evdev input and creates a virtual Xbox 360-style controller through Linux's `uinput` interface. It translates buttons, sticks, the D-pad, and triggers, and forwards standard rumble effects back to the DualSense.
 
-When the launched command exits, dsxinput removes the virtual controller and releases the physical one. If the controller disconnects, it shuts down the launched process group as well.
+If the controller disconnects, dsxinput removes the virtual controller and keeps the game running. While disconnected, it searches for a controller every 500 ms. Connecting or reconnecting creates a fresh virtual controller with the current button and axis state. The game must support controller hotplug to use a controller added during play.
+
+Device access or setup errors are reported without stopping the game; dsxinput keeps retrying. Read/write input access, `uinput` access, and physical rumble support are required for controller emulation.
+
+To select a specific input node, use `dsxinput --device /dev/input/eventN COMMAND [ARGS...]`. This retries only the specified path. Event numbers can change after reconnecting; omit `--device` for automatic discovery, or use a stable device symlink.
+
+When the launched command exits, dsxinput removes the virtual controller and releases the physical one. SIGINT or SIGTERM also stops the launched process group. `dsxinput --diagnose` runs detection and event forwarding for 30 seconds without launching a game, including when no controller is connected.
 
 Only one controller is handled at a time. DualSense-specific features such as adaptive triggers, advanced haptics, touchpad, and gyro are not supported. The evdev grab does not hide the original controller from hidraw, so some games may need their hidraw access disabled to avoid duplicate input.
