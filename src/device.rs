@@ -9,7 +9,10 @@ use crate::linux::{
 use std::{
     fs::{self, File, OpenOptions},
     io,
-    os::fd::{AsRawFd, RawFd},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::fs::OpenOptionsExt,
+    },
     path::{Path, PathBuf},
 };
 
@@ -48,7 +51,11 @@ pub(crate) fn gamepad_path() -> io::Result<PathBuf> {
 
 /// Open the physical controller for input and rumble output.
 pub(crate) fn open_physical(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).open(path)
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
 }
 
 /// Require rumble support rather than silently creating a controller without it.
@@ -79,6 +86,7 @@ pub(crate) fn virtual_pad() -> io::Result<VirtualController> {
     let f = OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NONBLOCK)
         .open("/dev/uinput")?;
     let fd = f.as_raw_fd();
     configure_virtual(|operation| match operation {
@@ -268,5 +276,21 @@ mod setup_failure_tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), 11);
+    }
+}
+
+#[cfg(test)]
+mod nonblocking_tests {
+    use super::*;
+
+    #[test]
+    fn physical_descriptor_is_nonblocking_to_handle_removal_after_poll() {
+        let file = open_physical(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/Cargo.toml"
+        )))
+        .unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
     }
 }
