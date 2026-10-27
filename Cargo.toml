@@ -1,0 +1,9 @@
+[package]
+name = "dsxinput"
+version = "0.1.1"
+edition = "2021"
+license = "MIT"
+description = "DualSense evdev to virtual Xbox-style uinput controller for Fedora"
+
+[dependencies]
+libc = "0.2"

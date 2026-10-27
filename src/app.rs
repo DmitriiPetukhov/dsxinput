@@ -1,0 +1,146 @@
+//! Runtime orchestration, event polling, and shutdown.
+use crate::{
+    cli,
+    device::{gamepad_path, open_physical, supports_rumble, virtual_pad},
+    feedback::forward_feedback,
+    linux::{
+        eviocgabs, ioctl_ref, ioctl_val, read_event, write_event, InputAbsInfo, ABS_HAT0X,
+        ABS_HAT0Y, ABS_RX, ABS_RY, ABS_RZ, ABS_X, ABS_Y, ABS_Z, EVIOCGRAB, EVIOCRMFF,
+    },
+    mapping,
+    process::spawn_game,
+};
+use std::{
+    env, io,
+    os::fd::{AsRawFd, RawFd},
+    thread,
+    time::{Duration, Instant},
+};
+
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Request shutdown without doing I/O in the signal handler.
+extern "C" fn handle_signal(_: libc::c_int) {
+    STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Set up controllers and relay events until shutdown or child exit.
+pub(crate) fn run() -> io::Result<i32> {
+    let cli::Options {
+        device: path,
+        no_rumble,
+        diagnostic,
+        command: args,
+    } = cli::Options::parse(env::args().skip(1));
+    if args.is_empty() && !diagnostic {
+        eprintln!("dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--no-rumble] [--diagnose] COMMAND [ARGS...]\n       dsxinput --diagnose", env!("CARGO_PKG_VERSION"));
+        return Ok(2);
+    }
+    let path = match path {
+        Some(p) => p,
+        None => gamepad_path()?,
+    };
+    let physical = open_physical(&path)?;
+    let pfd = physical.as_raw_fd();
+    eprintln!("dsxinput: source {}", path.display());
+    let mut axisinfo = [InputAbsInfo::default(); 18];
+    for code in [
+        ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y,
+    ] {
+        let _ = ioctl_ref(pfd, eviocgabs(code), &mut axisinfo[code as usize]);
+    }
+    let rumble = !no_rumble && supports_rumble(pfd);
+    eprintln!("dsxinput: physical FF_RUMBLE supported: {rumble}");
+    let virtual_pad = virtual_pad(rumble)?;
+    let vfd = virtual_pad.as_raw_fd();
+    // Exclusive evdev grab prevents most native apps seeing the original buttons; HIDRAW remains independently accessible.
+    ioctl_val(pfd, EVIOCGRAB, 1)?;
+    struct Grab(RawFd);
+    impl Drop for Grab {
+        fn drop(&mut self) {
+            let _ = ioctl_val(self.0, EVIOCGRAB, 0);
+        }
+    }
+    let _grab = Grab(pfd);
+    eprintln!("dsxinput: virtual Xbox-style controller ready (evdev grabbed)");
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+    }
+    let mut game = if diagnostic {
+        None
+    } else {
+        thread::sleep(Duration::from_millis(800));
+        Some(spawn_game(&args)?)
+    };
+    let mut ids = [-1i16; 16];
+    let started = Instant::now();
+    let mut status = 0;
+    loop {
+        if STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(ref mut child) = game {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGTERM);
+                }
+                let _ = child.wait();
+            }
+            break;
+        }
+        if let Some(ref mut child) = game {
+            if let Some(exit) = child.try_wait()? {
+                status = exit.code().unwrap_or(128);
+                break;
+            }
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: pfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: vfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "controller disconnected",
+            ));
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            let ev = read_event(pfd)?;
+            if let Some((kind, code, value)) = mapping::translate_event(ev, &axisinfo) {
+                write_event(vfd, kind, code, value)?;
+            }
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
+            let ev = read_event(vfd)?;
+            forward_feedback(vfd, pfd, ev, &mut ids)?;
+        }
+        if diagnostic && started.elapsed() > Duration::from_secs(30) {
+            break;
+        }
+    }
+    for id in ids {
+        if id >= 0 {
+            let _ = ioctl_val(pfd, EVIOCRMFF, id as i32);
+        }
+    }
+    Ok(status)
+}
