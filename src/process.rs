@@ -22,22 +22,23 @@ pub(crate) fn spawn_game(args: &[String]) -> io::Result<Child> {
 /// Own the child so runtime errors and signals share bounded shutdown.
 pub(crate) struct Game {
     child: Option<Child>,
+    status: Option<std::process::ExitStatus>,
 }
 
 impl Game {
     pub(crate) fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            status: None,
+        }
     }
 
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        let result = self
-            .child
-            .as_mut()
-            .expect("game already reaped")
-            .try_wait()?;
-        if result.is_some() {
-            self.child = None;
+        if self.status.is_none() {
+            self.status = self.child.as_mut().expect("game owns child").try_wait()?;
         }
+        // Keep ownership of the process group even when its launcher has exited.
+        let result = self.status;
         Ok(result)
     }
 }
@@ -256,5 +257,53 @@ mod shutdown_tests {
         let result = fail(child);
         assert!(result.is_err());
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+}
+
+#[cfg(test)]
+mod observed_exit_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn observing_launcher_exit_keeps_descendants_owned_and_status_repeatable() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "(trap '' TERM; echo ready; exec sleep 30) & exit 7"])
+            .process_group(0)
+            .stdout(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let group = -(child.id() as i32);
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        let mut game = Game::new(child);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = game.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "launcher failed to exit");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let repeated = game.try_wait().unwrap();
+        unsafe {
+            libc::fcntl(
+                output.get_ref().as_raw_fd(),
+                libc::F_SETFL,
+                libc::O_NONBLOCK,
+            );
+        }
+        drop(game);
+        let result = output.read(&mut [0; 1]);
+        unsafe {
+            libc::kill(group, libc::SIGKILL);
+        }
+        assert_eq!(ready, "ready\n");
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(repeated, Some(status));
+        assert!(matches!(result, Ok(0)), "descendant survived: {result:?}");
     }
 }
