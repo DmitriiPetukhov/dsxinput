@@ -1,12 +1,13 @@
 //! Launch the game in an isolated process group.
 use std::{
+    ffi::OsString,
     io,
     os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
 };
 
 /// Inherit the terminal and create a process group for shutdown signaling.
-pub(crate) fn spawn_game(args: &[String]) -> io::Result<Child> {
+pub(crate) fn spawn_game(args: &[OsString]) -> io::Result<Child> {
     let (program, arguments) = args
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "game command is empty"))?;
@@ -102,13 +103,13 @@ mod process_tests {
 
     #[test]
     fn forwards_child_arguments_and_exit_status() {
-        let args = ["/bin/sh", "-c", "exit \"$1\"", "game", "7"].map(String::from);
+        let args = ["/bin/sh", "-c", "exit \"$1\"", "game", "7"].map(OsString::from);
         assert_eq!(spawn_game(&args).unwrap().wait().unwrap().code(), Some(7));
     }
 
     #[test]
     fn missing_executable_returns_not_found() {
-        let args = ["/nonexistent/dsxinput-test-game".to_owned()];
+        let args = [OsString::from("/nonexistent/dsxinput-test-game")];
         assert_eq!(
             spawn_game(&args).unwrap_err().kind(),
             io::ErrorKind::NotFound
@@ -117,7 +118,7 @@ mod process_tests {
 
     #[test]
     fn child_has_its_own_process_group() {
-        let args = ["/bin/sleep", "30"].map(String::from);
+        let args = ["/bin/sleep", "30"].map(OsString::from);
         let mut child = spawn_game(&args).unwrap();
         let pid = child.id() as i32;
         let group = unsafe { libc::getpgid(pid) };

@@ -1,26 +1,26 @@
 //! Parse wrapper flags without interpreting the child command's arguments.
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Options {
     pub(crate) device: Option<PathBuf>,
     pub(crate) diagnostic: bool,
-    pub(crate) command: Vec<String>,
+    pub(crate) command: Vec<OsString>,
 }
 
 impl Options {
     /// Parse leading wrapper flags, then pass the command and all remaining arguments through.
     /// An optional `--` is accepted for compatibility.
-    pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Self {
+    pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Self {
         let mut args = args.into_iter().peekable();
         let mut options = Self::default();
         while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--device" if args.peek().is_some() => {
+            match arg.to_str() {
+                Some("--device") if args.peek().is_some() => {
                     options.device = args.next().map(PathBuf::from);
                 }
-                "--diagnose" => options.diagnostic = true,
-                "--" => {
+                Some("--diagnose") => options.diagnostic = true,
+                Some("--") => {
                     options.command.extend(args);
                     break;
                 }
@@ -40,7 +40,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Options {
-        Options::parse(args.iter().map(|arg| arg.to_string()))
+        Options::parse(args.iter().map(|arg| OsString::from(arg)))
     }
 
     #[test]
@@ -144,5 +144,32 @@ mod tests {
     fn empty_input_has_default_options() {
         assert_eq!(parse(&[]), Options::default());
         assert_eq!(parse(&["--"]), Options::default());
+    }
+}
+
+#[cfg(test)]
+mod native_argument_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn preserves_non_utf8_device_paths_and_child_arguments() {
+        let raw = OsString::from_vec(vec![b'/', b'x', 0xff]);
+        let options = Options::parse([
+            "--device".into(),
+            raw.clone(),
+            "game".into(),
+            raw.clone(),
+            "".into(),
+        ]);
+        assert_eq!(options.device, Some(PathBuf::from(&raw)));
+        assert_eq!(
+            options.command,
+            [OsString::from("game"), raw.clone(), OsString::new()]
+        );
+        assert_eq!(
+            Options::parse([raw.clone(), "--diagnose".into()]).command,
+            [raw, "--diagnose".into()]
+        );
     }
 }

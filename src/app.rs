@@ -26,7 +26,7 @@ pub(crate) fn run() -> io::Result<i32> {
         device: path,
         diagnostic,
         command: args,
-    } = cli::Options::parse(env::args().skip(1));
+    } = cli::Options::parse(env::args_os().skip(1));
     if args.is_empty() && !diagnostic {
         eprintln!("dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--diagnose] COMMAND [ARGS...]\n       dsxinput --diagnose", env!("CARGO_PKG_VERSION"));
         return Ok(2);
