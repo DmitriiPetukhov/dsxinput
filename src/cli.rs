@@ -40,7 +40,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Options {
-        Options::parse(args.iter().map(|arg| OsString::from(arg)))
+        Options::parse(args.iter().map(OsString::from))
     }
 
     #[test]
