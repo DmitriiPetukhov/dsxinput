@@ -1,6 +1,8 @@
-# dsxinput
+# dsxinput — DualSense to XInput for Linux
 
-A small utility for using DualSense controllers in Linux games.
+Use your PS5 DualSense controller in Linux games that expect an Xbox 360 controller—without Steam or Steam Input.
+
+Wrap your game command with `dsxinput`. Controller emulation runs only while the game is running. Supports USB, Bluetooth, and standard rumble.
 
 Valve's Steam Input makes this easy: it can emulate an XInput controller for games that don't support DualSense directly. But for games bought elsewhere and run through other launchers, that usually means adding them to Steam first and enabling Steam Input there. I wanted something simpler—a command you can add to a game's launch settings, with controller emulation running only for that game.
 
@@ -83,3 +85,19 @@ To select a specific input node, use `dsxinput --device /dev/input/eventN COMMAN
 When the launched command exits, dsxinput removes the virtual controller and releases the physical one. SIGINT or SIGTERM also stops the launched process group. `dsxinput --diagnose` runs detection and event forwarding for 30 seconds without launching a game, including when no controller is connected.
 
 Only one controller is handled at a time. DualSense-specific features such as adaptive triggers, advanced haptics, touchpad, and gyro are not supported. The evdev grab does not hide the original controller from hidraw, so some games may need their hidraw access disabled to avoid duplicate input.
+
+## Troubleshooting
+
+### The game does not detect the controller
+
+Run `dsxinput --diagnose` to check detection and event forwarding without launching a game. Check the reported errors: your user needs read/write access to the DualSense input device and access to `/dev/uinput`, and the controller must support physical rumble.
+
+If you connected the controller after starting the game, try connecting it before launch. Some games do not support controller hotplug. If you use `--device`, check that the path still points to the controller after reconnecting, or omit it to enable automatic discovery.
+
+### Permission denied for /dev/uinput
+
+Follow the `uinput` setup steps under [Dependencies and device access](#dependencies-and-device-access). Log out and back in if the permission change does not take effect.
+
+### The game receives duplicate input
+
+Some games can read the physical DualSense through hidraw alongside the virtual Xbox controller. Disable the game's hidraw controller access if it provides that option.
