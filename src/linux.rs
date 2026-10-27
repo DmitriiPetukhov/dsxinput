@@ -224,6 +224,10 @@ pub(crate) fn write_event(fd: RawFd, kind: u16, code: u16, value: i32) -> io::Re
             size_of::<InputEvent>(),
         )
     });
+    check_event_write(n)
+}
+
+fn check_event_write(n: isize) -> io::Result<()> {
     if n == size_of::<InputEvent>() as isize {
         Ok(())
     } else if n < 0 {
@@ -361,6 +365,46 @@ mod interruption_tests {
             });
             assert_eq!(result, final_result);
             assert_eq!(calls, 3);
+        }
+    }
+}
+
+#[cfg(test)]
+mod transfer_failure_tests {
+    use super::*;
+    use std::os::{fd::AsRawFd, unix::net::UnixStream};
+
+    #[test]
+    fn short_writes_report_write_zero_even_with_stale_errno() {
+        for size in 0..size_of::<InputEvent>() {
+            unsafe {
+                *libc::__errno_location() = libc::EACCES;
+            }
+            let error = check_event_write(size as isize).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+            assert_eq!(error.raw_os_error(), None);
+        }
+        check_event_write(size_of::<InputEvent>() as isize).unwrap();
+    }
+
+    #[test]
+    fn nonblocking_empty_input_reports_would_block() {
+        let (_writer, reader) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        assert_eq!(
+            read_event(reader.as_raw_fd()).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn queued_events_are_read_one_at_a_time_in_order() {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        for value in [1, 0, 2] {
+            write_event(writer.as_raw_fd(), EV_KEY, BTN_SOUTH, value).unwrap();
+        }
+        for value in [1, 0, 2] {
+            assert_eq!(read_event(reader.as_raw_fd()).unwrap().value, value);
         }
     }
 }
