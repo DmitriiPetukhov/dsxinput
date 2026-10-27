@@ -75,6 +75,13 @@ pub(crate) struct VirtualController {
     file: File,
 }
 
+#[cfg(test)]
+impl VirtualController {
+    pub(crate) fn from_test_file(file: File) -> Self {
+        Self { file }
+    }
+}
+
 impl Drop for VirtualController {
     fn drop(&mut self) {
         let _ = ioctl_val(self.file.as_raw_fd(), UI_DEV_DESTROY, 0);

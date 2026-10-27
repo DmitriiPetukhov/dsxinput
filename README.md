@@ -74,17 +74,11 @@ Replace `/home/your-user` with your home directory. Faugus adds the game command
 
 ## How it works
 
-dsxinput launches the game even when no controller is connected. When it detects an accessible DualSense, it takes exclusive access to its evdev input and creates a virtual Xbox 360-style controller through Linux's `uinput` interface. It translates buttons, sticks, the D-pad, and triggers, and forwards standard rumble effects back to the DualSense.
+dsxinput creates a virtual Xbox 360-style controller before launching the game and forwards DualSense input and standard rumble. You can connect or reconnect the DualSense during play: the game keeps the same virtual controller, and disconnecting clears held input. Connection or setup errors are reported without stopping the game.
 
-If the controller disconnects, dsxinput removes the virtual controller and keeps the game running. While disconnected, it searches for a controller every 500 ms. Connecting or reconnecting creates a fresh virtual controller with the current button and axis state. The game must support controller hotplug to use a controller added during play.
+When the game command exits, dsxinput removes the virtual controller and releases the DualSense. SIGINT or SIGTERM also stops the launched process group.
 
-Device access or setup errors are reported without stopping the game; dsxinput keeps retrying. Read/write input access, `uinput` access, and physical rumble support are required for controller emulation.
-
-To select a specific input node, use `dsxinput --device /dev/input/eventN COMMAND [ARGS...]`. This retries only the specified path. Event numbers can change after reconnecting; omit `--device` for automatic discovery, or use a stable device symlink.
-
-When the launched command exits, dsxinput removes the virtual controller and releases the physical one. SIGINT or SIGTERM also stops the launched process group. `dsxinput --diagnose` runs detection and event forwarding for 30 seconds without launching a game, including when no controller is connected.
-
-Only one controller is handled at a time. DualSense-specific features such as adaptive triggers, advanced haptics, touchpad, and gyro are not supported. The evdev grab does not hide the original controller from hidraw, so some games may need their hidraw access disabled to avoid duplicate input.
+Only one controller is supported at a time. Adaptive triggers, advanced haptics, touchpad, and gyro are unsupported. Some games can also detect the physical DualSense and may need their hidraw access disabled to avoid duplicate input.
 
 ## Troubleshooting
 
@@ -92,7 +86,7 @@ Only one controller is handled at a time. DualSense-specific features such as ad
 
 Run `dsxinput --diagnose` to check detection and event forwarding without launching a game. Check the reported errors: your user needs read/write access to the DualSense input device and access to `/dev/uinput`, and the controller must support physical rumble.
 
-If you connected the controller after starting the game, try connecting it before launch. Some games do not support controller hotplug. If you use `--device`, check that the path still points to the controller after reconnecting, or omit it to enable automatic discovery.
+The virtual controller should exist before the game starts. Check the dsxinput output for virtual controller setup errors. If you use `--device`, check that the path still points to the controller after reconnecting, or omit it to enable automatic discovery.
 
 ### Permission denied for /dev/uinput
 

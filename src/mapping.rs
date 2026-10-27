@@ -12,6 +12,20 @@ fn axis_to_signed(raw: i32, info: &InputAbsInfo) -> i32 {
         as i32
 }
 
+// Suppress resting stick noise within 1/16 of each half-axis. Rescale the
+// remaining travel so the boundary is continuous and full deflection is kept.
+fn stick_to_signed(raw: i32, info: &InputAbsInfo) -> i32 {
+    const DEADZONE: i32 = 2048;
+    let value = axis_to_signed(raw, info);
+    if value > DEADZONE {
+        (value - DEADZONE) * 32767 / (32767 - DEADZONE)
+    } else if value < -DEADZONE {
+        (value + DEADZONE) * 32768 / (32768 - DEADZONE)
+    } else {
+        0
+    }
+}
+
 /// Scale and clamp a physical trigger range to 0..=255.
 fn axis_to_trigger(raw: i32, info: &InputAbsInfo) -> i32 {
     let span = (i64::from(info.maximum) - i64::from(info.minimum)).max(1);
@@ -49,7 +63,7 @@ pub(crate) fn translate_event(
         EV_ABS => map_axis(event.code).map(|code| {
             let value = match code {
                 ABS_X | ABS_Y | ABS_RX | ABS_RY => {
-                    axis_to_signed(event.value, &axes[code as usize])
+                    stick_to_signed(event.value, &axes[code as usize])
                 }
                 ABS_Z | ABS_RZ => axis_to_trigger(event.value, &axes[code as usize]),
                 _ => event.value.clamp(-1, 1),
@@ -327,6 +341,53 @@ mod invariant_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod resting_stick_tests {
+    use super::*;
+
+    #[test]
+    fn deadzone_preserves_full_travel_and_is_monotone() {
+        let range = InputAbsInfo {
+            minimum: -32768,
+            maximum: 32767,
+            ..Default::default()
+        };
+        let mut previous = -32768;
+        for raw in -32768..=32767 {
+            let value = stick_to_signed(raw, &range);
+            assert!((-32768..=32767).contains(&value));
+            assert!(value >= previous);
+            if (-2048..=2048).contains(&raw) {
+                assert_eq!(value, 0);
+            }
+            previous = value;
+        }
+        assert_eq!(stick_to_signed(-32768, &range), -32768);
+        assert_eq!(stick_to_signed(32767, &range), 32767);
+        assert!(stick_to_signed(-4096, &range) < 0);
+        assert!(stick_to_signed(4096, &range) > 0);
+    }
+
+    #[test]
+    fn bluetooth_controller_resting_samples_do_not_move_either_stick() {
+        let axes = [InputAbsInfo {
+            minimum: 0,
+            maximum: 255,
+            ..Default::default()
+        }; 18];
+        // Samples read from the user's untouched DualSense over Bluetooth.
+        for (code, value) in [(ABS_X, 125), (ABS_Y, 126), (ABS_RX, 129), (ABS_RY, 128)] {
+            let event = InputEvent {
+                time: unsafe { std::mem::zeroed() },
+                kind: EV_ABS,
+                code,
+                value,
+            };
+            assert_eq!(translate_event(event, &axes), Some((EV_ABS, code, 0)));
         }
     }
 }

@@ -11,6 +11,17 @@ const KEYS: [u16; 11] = [
     BTN_THUMBL, BTN_THUMBR,
 ];
 
+/// Write neutral values in virtual Xbox coordinates, without physical scaling.
+pub(crate) fn neutralize(emit: &mut impl FnMut(u16, u16, i32) -> io::Result<()>) -> io::Result<()> {
+    for code in AXES {
+        emit(EV_ABS, code, 0)?;
+    }
+    for code in KEYS {
+        emit(EV_KEY, code, 0)?;
+    }
+    emit(EV_SYN, SYN_REPORT, 0)
+}
+
 pub(crate) struct Snapshot {
     axes: [InputAbsInfo; 18],
     keys: [u8; 96],
@@ -24,7 +35,7 @@ impl Snapshot {
         )
     }
 
-    fn read_with(
+    pub(crate) fn read_with(
         mut query_axis: impl FnMut(u16, &mut InputAbsInfo) -> io::Result<()>,
         mut query_keys: impl FnMut(&mut [u8; 96]) -> io::Result<()>,
     ) -> io::Result<Self> {
@@ -152,7 +163,7 @@ mod tests {
         .unwrap();
         assert!(output.contains(&(EV_KEY, BTN_SOUTH, 1)));
         assert!(output.contains(&(EV_KEY, BTN_EAST, 0)));
-        assert!(output.contains(&(EV_ABS, ABS_X, 128)));
+        assert!(output.contains(&(EV_ABS, ABS_X, 0)));
         assert!(output.contains(&(EV_ABS, ABS_Z, 128)));
         assert_eq!(output.last(), Some(&(EV_SYN, SYN_REPORT, 0)));
         assert_eq!(output.len(), AXES.len() + KEYS.len() + 1);
@@ -384,5 +395,34 @@ mod snapshot_query_tests {
             assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::ENODEV));
             assert_eq!(calls, (failure + 1).min(AXES.len()));
         }
+    }
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_releases_every_button_and_centers_every_virtual_axis() {
+        let mut events = Vec::new();
+        neutralize(&mut |kind, code, value| {
+            events.push((kind, code, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(events.len(), AXES.len() + KEYS.len() + 1);
+        for code in AXES {
+            assert!(
+                events.contains(&(EV_ABS, code, 0)),
+                "axis {code} was not centered"
+            );
+        }
+        for code in KEYS {
+            assert!(
+                events.contains(&(EV_KEY, code, 0)),
+                "button {code} was not released"
+            );
+        }
+        assert_eq!(events.last(), Some(&(EV_SYN, SYN_REPORT, 0)));
     }
 }

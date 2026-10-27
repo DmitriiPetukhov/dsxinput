@@ -17,6 +17,7 @@ struct Fake {
     attempts: Vec<Duration>,
     next_id: usize,
     launch_error: bool,
+    prepared: bool,
     status_error: bool,
 }
 impl Default for Fake {
@@ -31,6 +32,7 @@ impl Default for Fake {
             attempts: Vec::new(),
             next_id: 0,
             launch_error: false,
+            prepared: false,
             status_error: false,
         }
     }
@@ -40,6 +42,9 @@ fn missing() -> io::Result<()> {
 }
 impl Runtime for Fake {
     type Controller = Pad;
+    fn prepare(&mut self) {
+        self.prepared = true;
+    }
     fn elapsed(&self) -> Duration {
         self.now
     }
@@ -60,6 +65,7 @@ impl Runtime for Fake {
         self.now += Duration::from_millis(800);
     }
     fn launch(&mut self) -> io::Result<()> {
+        assert!(self.prepared, "prepare virtual controller before launching");
         self.log.borrow_mut().push("launch".into());
         if self.launch_error {
             Err(io::Error::other("spawn failed"))
@@ -100,6 +106,10 @@ fn missing_controller_never_prevents_launch_or_changes_game_status() {
         ..Default::default()
     };
     assert_eq!(run_runtime(&mut fake, false).unwrap(), 7);
+    assert!(
+        fake.prepared,
+        "virtual controller must be prepared even without a physical pad"
+    );
     let log = fake.log.borrow();
     assert_eq!(log.iter().filter(|s| *s == "launch").count(), 1);
     assert!(!log.iter().any(|s| s == "settle"));
@@ -332,14 +342,22 @@ fn poll_timeout_and_terminal_conditions_do_not_dispatch_events() {
 }
 #[test]
 fn controller_connect_reports_missing_source_and_rejects_non_controller_files() {
-    let error = Controller::connect(PathBuf::from("/nonexistent/dsxinput-device"))
-        .err()
-        .unwrap();
+    let error = Controller::connect(
+        PathBuf::from("/nonexistent/dsxinput-device"),
+        &mut None,
+        Rc::new(RefCell::new(FeedbackState::default())),
+    )
+    .err()
+    .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
     assert!(error.to_string().contains("/nonexistent/dsxinput-device"));
-    let error = Controller::connect(PathBuf::from("/dev/null"))
-        .err()
-        .unwrap();
+    let error = Controller::connect(
+        PathBuf::from("/dev/null"),
+        &mut None,
+        Rc::new(RefCell::new(FeedbackState::default())),
+    )
+    .err()
+    .unwrap();
     assert_eq!(error.raw_os_error(), Some(libc::ENOTTY));
 }
 
@@ -407,4 +425,76 @@ fn child_exit_while_attached_releases_controller_and_preserves_status() {
     assert_eq!(run_runtime(&mut fake, false).unwrap(), 42);
     assert_eq!(fake.log.borrow().last().unwrap(), "drop:1");
     assert_eq!(fake.now, Duration::from_secs(1));
+}
+
+#[test]
+fn virtual_device_survives_physical_sessions_and_creation_is_retried_on_failure() {
+    let mut cached = None;
+    assert!(
+        retain_virtual(&mut cached, || Err::<Pad, _>(io::Error::other(
+            "setup failed"
+        )))
+        .is_err()
+    );
+    assert!(cached.is_none());
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let first = retain_virtual(&mut cached, || Ok(Pad(log.clone(), 1))).unwrap();
+    drop(first);
+    assert!(
+        log.borrow().is_empty(),
+        "disconnect destroyed the virtual controller"
+    );
+    let second = retain_virtual(&mut cached, || {
+        panic!("reconnect must reuse virtual device")
+    })
+    .unwrap();
+    assert_eq!(second.1, 1);
+    drop(second);
+    drop(cached);
+    assert_eq!(*log.borrow(), ["drop:1"]);
+}
+
+#[test]
+fn ending_physical_session_neutralizes_but_keeps_virtual_input_open() {
+    use crate::linux::*;
+    use std::os::unix::net::UnixStream;
+    let (writer, reader) = UnixStream::pair().unwrap();
+    let retained = Rc::new(VirtualController::from_test_file(File::from(
+        std::os::fd::OwnedFd::from(writer),
+    )));
+    let state = Snapshot::read_with(
+        |_, axis| {
+            axis.minimum = 0;
+            axis.maximum = 255;
+            axis.value = 255;
+            Ok(())
+        },
+        |keys| {
+            keys.fill(255);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let relay = Relay::new(state, &mut |_, _, _| Ok(())).unwrap();
+    let controller = Controller {
+        virtual_pad: retained.clone(),
+        physical: Grabbed(File::open("/dev/null").unwrap()),
+        relay,
+        feedback: Rc::new(RefCell::new(FeedbackState::default())),
+    };
+    drop(controller);
+    for _ in 0..19 {
+        let event = read_event(reader.as_raw_fd()).unwrap();
+        assert!(matches!(event.kind, EV_KEY | EV_ABS));
+        assert_eq!(event.value, 0);
+    }
+    let report = read_event(reader.as_raw_fd()).unwrap();
+    assert_eq!((report.kind, report.code), (EV_SYN, SYN_REPORT));
+    // The next physical session writes into the same stream the game already opened.
+    write_event(retained.as_raw_fd(), EV_KEY, BTN_SOUTH, 1).unwrap();
+    let press = read_event(reader.as_raw_fd()).unwrap();
+    assert_eq!(
+        (press.kind, press.code, press.value),
+        (EV_KEY, BTN_SOUTH, 1)
+    );
 }

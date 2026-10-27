@@ -2,17 +2,19 @@
 use crate::{
     cli,
     device::{gamepad_path, open_physical, require_rumble, virtual_pad, VirtualController},
-    feedback::forward_feedback,
-    linux::{ioctl_val, read_event, write_event, EVIOCGRAB, EVIOCRMFF},
+    feedback::FeedbackState,
+    linux::{ioctl_val, read_event, write_event, EVIOCGRAB},
     process::{spawn_game, Game},
-    relay::{Relay, Snapshot},
+    relay::{neutralize, Relay, Snapshot},
 };
 use std::{
+    cell::RefCell,
     env,
     fs::File,
     io,
     os::fd::AsRawFd,
     path::PathBuf,
+    rc::Rc,
     thread,
     time::{Duration, Instant},
 };
@@ -47,6 +49,9 @@ pub(crate) fn run() -> io::Result<i32> {
             options,
             game: None,
             started: Instant::now(),
+            virtual_pad: None,
+            settled: false,
+            feedback: Rc::new(RefCell::new(FeedbackState::default())),
         },
         diagnostic,
     )
@@ -56,6 +61,7 @@ pub(crate) fn run() -> io::Result<i32> {
 /// runtime owns the child; this function drops its controller before returning.
 trait Runtime {
     type Controller;
+    fn prepare(&mut self);
     fn elapsed(&self) -> Duration;
     fn stopped(&self) -> bool;
     fn connect(&mut self) -> io::Result<Self::Controller>;
@@ -67,6 +73,9 @@ trait Runtime {
 }
 
 fn run_runtime(runtime: &mut impl Runtime, diagnostic: bool) -> io::Result<i32> {
+    if !runtime.stopped() {
+        runtime.prepare();
+    }
     let mut controller = None;
     let mut next_attempt = Duration::ZERO;
     let mut last_error = None;
@@ -110,7 +119,7 @@ fn run_runtime(runtime: &mut impl Runtime, diagnostic: bool) -> io::Result<i32> 
             launched = true;
         }
         if let Err(error) = runtime.wait(controller.as_mut()) {
-            // Drop the virtual device, grab, physical fd and rumble state now.
+            // Release physical input and neutralize the retained virtual controller.
             controller = None;
             runtime.report(&format!(
                 "controller session ended: {error}; waiting for reconnect"
@@ -124,9 +133,17 @@ struct SystemRuntime {
     options: cli::Options,
     game: Option<Game>,
     started: Instant,
+    virtual_pad: Option<Rc<VirtualController>>,
+    settled: bool,
+    feedback: Rc<RefCell<FeedbackState>>,
 }
 impl Runtime for SystemRuntime {
     type Controller = Controller;
+    fn prepare(&mut self) {
+        if let Err(error) = retain_virtual(&mut self.virtual_pad, virtual_pad) {
+            self.report(&format!("waiting for virtual controller: {error}"));
+        }
+    }
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
@@ -138,12 +155,20 @@ impl Runtime for SystemRuntime {
             Some(path) => path.clone(),
             None => gamepad_path()?,
         };
-        Controller::connect(path)
+        Controller::connect(path, &mut self.virtual_pad, self.feedback.clone())
     }
     fn settle(&mut self) {
         thread::sleep(Duration::from_millis(800));
+        self.settled = true;
     }
     fn launch(&mut self) -> io::Result<()> {
+        // Let the launcher discover the virtual pad even when DualSense is absent.
+        if self.virtual_pad.is_some() && !self.settled {
+            self.settle();
+        }
+        if self.stopped() {
+            return Ok(());
+        }
         self.game = Some(Game::new(spawn_game(&self.options.command)?));
         Ok(())
     }
@@ -158,7 +183,28 @@ impl Runtime for SystemRuntime {
         match controller {
             Some(controller) => controller.poll(),
             None => {
-                thread::sleep(POLL_INTERVAL);
+                if let Some(pad) = &self.virtual_pad {
+                    let fd = pad.as_raw_fd();
+                    let mut poll = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let result =
+                        unsafe { libc::poll(&mut poll, 1, POLL_INTERVAL.as_millis() as i32) };
+                    if result < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                    check_poll(poll.revents, "virtual controller")?;
+                    dispatch_event(poll.revents, fd, &mut |event| {
+                        self.feedback.borrow_mut().process(fd, -1, event)
+                    })?;
+                } else {
+                    thread::sleep(POLL_INTERVAL);
+                }
                 Ok(())
             }
         }
@@ -166,6 +212,17 @@ impl Runtime for SystemRuntime {
     fn report(&mut self, message: &str) {
         eprintln!("dsxinput: {message}");
     }
+}
+
+/// Keep the same uinput identity across disposable physical connections.
+fn retain_virtual<T>(
+    cached: &mut Option<Rc<T>>,
+    create: impl FnOnce() -> io::Result<T>,
+) -> io::Result<Rc<T>> {
+    if cached.is_none() {
+        *cached = Some(Rc::new(create()?));
+    }
+    Ok(cached.as_ref().unwrap().clone())
 }
 
 /// The grab owns its descriptor, including during partial session setup.
@@ -183,31 +240,37 @@ impl Drop for Grabbed {
 }
 
 struct Controller {
-    // Fields drop in declaration order: remove virtual device before releasing grab.
-    virtual_pad: VirtualController,
+    // The runtime retains the virtual device when this physical session ends.
+    virtual_pad: Rc<VirtualController>,
     physical: Grabbed,
     relay: Relay,
-    ids: [i16; 16],
+    feedback: Rc<RefCell<FeedbackState>>,
 }
 impl Controller {
-    fn connect(path: PathBuf) -> io::Result<Self> {
+    fn connect(
+        path: PathBuf,
+        cached: &mut Option<Rc<VirtualController>>,
+        feedback: Rc<RefCell<FeedbackState>>,
+    ) -> io::Result<Self> {
         let physical = open_physical(&path).map_err(|error| {
             io::Error::new(error.kind(), format!("{}: {error}", path.display()))
         })?;
         let pfd = physical.as_raw_fd();
         require_rumble(pfd)?;
         let physical = Grabbed::new(physical)?;
-        let virtual_pad = virtual_pad()?;
+        let snapshot = Snapshot::read(pfd)?;
+        let virtual_pad = retain_virtual(cached, virtual_pad)?;
         let vfd = virtual_pad.as_raw_fd();
-        let relay = Relay::new(Snapshot::read(pfd)?, &mut |kind, code, value| {
+        let relay = Relay::new(snapshot, &mut |kind, code, value| {
             write_event(vfd, kind, code, value)
         })?;
+        feedback.borrow_mut().attach(pfd);
         eprintln!("dsxinput: source {}; virtual Xbox-style controller ready (evdev grabbed, rumble enabled)", path.display());
         Ok(Self {
             virtual_pad,
             physical,
             relay,
-            ids: [-1; 16],
+            feedback,
         })
     }
     fn poll(&mut self) -> io::Result<()> {
@@ -223,7 +286,7 @@ impl Controller {
                     &mut |kind, code, value| write_event(vfd, kind, code, value),
                 )
             },
-            |event| forward_feedback(vfd, pfd, event, &mut self.ids),
+            |event| self.feedback.borrow_mut().process(vfd, pfd, event),
         )
     }
 }
@@ -280,11 +343,14 @@ fn dispatch_event(
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        for id in self.ids {
-            if id >= 0 {
-                let _ = ioctl_val(self.physical.0.as_raw_fd(), EVIOCRMFF, id as i32);
-            }
+        let fd = self.virtual_pad.as_raw_fd();
+        if let Err(error) = neutralize(&mut |kind, code, value| write_event(fd, kind, code, value))
+        {
+            eprintln!("dsxinput: failed to reset controller state: {error}");
         }
+        self.feedback
+            .borrow_mut()
+            .detach(self.physical.0.as_raw_fd());
     }
 }
 
