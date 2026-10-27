@@ -106,12 +106,8 @@ pub(crate) fn run() -> io::Result<i32> {
             }
             return Err(e);
         }
-        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "controller disconnected",
-            ));
-        }
+        check_poll(fds[0].revents, "physical controller")?;
+        check_poll(fds[1].revents, "virtual controller")?;
         if fds[0].revents & libc::POLLIN != 0 {
             let ev = read_event(pfd)?;
             relay.process(ev, &mut || Snapshot::read(pfd), &mut |kind, code, value| {
@@ -132,4 +128,49 @@ pub(crate) fn run() -> io::Result<i32> {
         }
     }
     Ok(status)
+}
+
+/// Check terminal poll conditions before attempting potentially blocking I/O.
+fn check_poll(events: i16, device: &str) -> io::Result<()> {
+    if events & libc::POLLNVAL != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{device}: invalid descriptor"),
+        ));
+    }
+    if events & (libc::POLLHUP | libc::POLLERR) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!("{device}: disconnected or failed"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_poll_conditions_override_readability_for_both_devices() {
+        for device in ["physical controller", "virtual controller"] {
+            for flag in [libc::POLLHUP, libc::POLLERR, libc::POLLNVAL] {
+                for readable in [0, libc::POLLIN] {
+                    let error = check_poll(flag | readable, device).unwrap_err();
+                    assert!(error.to_string().contains(device));
+                    assert_eq!(
+                        error.kind(),
+                        if flag == libc::POLLNVAL {
+                            io::ErrorKind::InvalidInput
+                        } else {
+                            io::ErrorKind::NotConnected
+                        }
+                    );
+                }
+            }
+            for flag in [0, libc::POLLIN, libc::POLLOUT] {
+                check_poll(flag, device).unwrap();
+            }
+        }
+    }
 }
