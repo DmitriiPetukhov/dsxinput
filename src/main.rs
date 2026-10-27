@@ -6,6 +6,7 @@ mod feedback;
 mod linux;
 mod mapping;
 mod process;
+mod relay;
 
 /// Report runtime errors and return the wrapper or child exit status.
 fn main() {

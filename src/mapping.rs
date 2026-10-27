@@ -31,8 +31,8 @@ fn map_key(code: u16) -> Option<u16> {
     match code {
         BTN_NORTH => Some(BTN_WEST), // Triangle -> Xbox Y
         BTN_WEST => Some(BTN_NORTH), // Square -> Xbox X
-        BTN_SOUTH | BTN_EAST | BTN_TL | BTN_TR | BTN_SELECT | BTN_START
-        | BTN_MODE | BTN_THUMBL | BTN_THUMBR => Some(code),
+        BTN_SOUTH | BTN_EAST | BTN_TL | BTN_TR | BTN_SELECT | BTN_START | BTN_MODE | BTN_THUMBL
+        | BTN_THUMBR => Some(code),
         _ => None,
     }
 }

@@ -3,12 +3,9 @@ use crate::{
     cli,
     device::{gamepad_path, open_physical, supports_rumble, virtual_pad},
     feedback::forward_feedback,
-    linux::{
-        eviocgabs, ioctl_ref, ioctl_val, read_event, write_event, InputAbsInfo, ABS_HAT0X,
-        ABS_HAT0Y, ABS_RX, ABS_RY, ABS_RZ, ABS_X, ABS_Y, ABS_Z, EVIOCGRAB, EVIOCRMFF,
-    },
-    mapping,
+    linux::{ioctl_val, read_event, write_event, EVIOCGRAB, EVIOCRMFF},
     process::{spawn_game, Game},
+    relay::{Relay, Snapshot},
 };
 use std::{
     env, io,
@@ -44,12 +41,6 @@ pub(crate) fn run() -> io::Result<i32> {
     let physical = open_physical(&path)?;
     let pfd = physical.as_raw_fd();
     eprintln!("dsxinput: source {}", path.display());
-    let mut axisinfo = [InputAbsInfo::default(); 18];
-    for code in [
-        ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y,
-    ] {
-        let _ = ioctl_ref(pfd, eviocgabs(code), &mut axisinfo[code as usize]);
-    }
     let rumble = !no_rumble && supports_rumble(pfd);
     eprintln!("dsxinput: physical FF_RUMBLE supported: {rumble}");
     let virtual_pad = virtual_pad(rumble)?;
@@ -74,6 +65,9 @@ pub(crate) fn run() -> io::Result<i32> {
             handle_signal as *const () as libc::sighandler_t,
         );
     }
+    let mut relay = Relay::new(Snapshot::read(pfd)?, &mut |kind, code, value| {
+        write_event(vfd, kind, code, value)
+    })?;
     if !diagnostic {
         thread::sleep(Duration::from_millis(800));
         if !STOP.load(std::sync::atomic::Ordering::SeqCst) {
@@ -121,9 +115,9 @@ pub(crate) fn run() -> io::Result<i32> {
         }
         if fds[0].revents & libc::POLLIN != 0 {
             let ev = read_event(pfd)?;
-            if let Some((kind, code, value)) = mapping::translate_event(ev, &axisinfo) {
-                write_event(vfd, kind, code, value)?;
-            }
+            relay.process(ev, &mut || Snapshot::read(pfd), &mut |kind, code, value| {
+                write_event(vfd, kind, code, value)
+            })?;
         }
         if fds[1].revents & libc::POLLIN != 0 {
             let ev = read_event(vfd)?;
