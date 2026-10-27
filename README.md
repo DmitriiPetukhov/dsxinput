@@ -74,4 +74,4 @@ cargo build --release --locked
 
 Input state is synchronized at startup and after evdev queue overflows to restore held controls and lost releases.
 
-The tests run without controller permissions or launching the application. They cover native command arguments, exhaustive event-code checks, scaling invariants, ABI layouts, event I/O failures, rumble transactions with injected errors, controller setup failures, state recovery, and child process cleanup. See the [reliability mindmap and test inventory](docs/reliability.md) for assertions, validation commands, and remaining hardware/integration checks.
+The tests run without controller permissions or launching the application. They cover native command arguments, exhaustive event-code checks, scaling invariants, ABI layouts, event I/O failures, rumble transactions with injected errors, controller setup failures, state recovery, and child process cleanup. Hardware and full event-loop integration still require runtime validation.
