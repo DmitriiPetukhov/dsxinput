@@ -8,7 +8,7 @@ use crate::{
         ABS_HAT0Y, ABS_RX, ABS_RY, ABS_RZ, ABS_X, ABS_Y, ABS_Z, EVIOCGRAB, EVIOCRMFF,
     },
     mapping,
-    process::spawn_game,
+    process::{spawn_game, Game},
 };
 use std::{
     env, io,
@@ -35,6 +35,8 @@ pub(crate) fn run() -> io::Result<i32> {
         eprintln!("dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--no-rumble] [--diagnose] COMMAND [ARGS...]\n       dsxinput --diagnose", env!("CARGO_PKG_VERSION"));
         return Ok(2);
     }
+    // Declared first: controller resources drop before child shutdown.
+    let mut game: Option<Game> = None;
     let path = match path {
         Some(p) => p,
         None => gamepad_path()?,
@@ -72,23 +74,17 @@ pub(crate) fn run() -> io::Result<i32> {
             handle_signal as *const () as libc::sighandler_t,
         );
     }
-    let mut game = if diagnostic {
-        None
-    } else {
+    if !diagnostic {
         thread::sleep(Duration::from_millis(800));
-        Some(spawn_game(&args)?)
-    };
+        if !STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            game = Some(Game::new(spawn_game(&args)?));
+        }
+    }
     let mut ids = [-1i16; 16];
     let started = Instant::now();
     let mut status = 0;
     loop {
         if STOP.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Some(ref mut child) = game {
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGTERM);
-                }
-                let _ = child.wait();
-            }
             break;
         }
         if let Some(ref mut child) = game {
