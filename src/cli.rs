@@ -1,28 +1,26 @@
 //! Parse wrapper flags without interpreting the child command's arguments.
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Options {
     pub(crate) device: Option<PathBuf>,
-    pub(crate) no_rumble: bool,
     pub(crate) diagnostic: bool,
-    pub(crate) command: Vec<String>,
+    pub(crate) command: Vec<OsString>,
 }
 
 impl Options {
     /// Parse leading wrapper flags, then pass the command and all remaining arguments through.
     /// An optional `--` is accepted for compatibility.
-    pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Self {
+    pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Self {
         let mut args = args.into_iter().peekable();
         let mut options = Self::default();
         while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--device" if args.peek().is_some() => {
+            match arg.to_str() {
+                Some("--device") if args.peek().is_some() => {
                     options.device = args.next().map(PathBuf::from);
                 }
-                "--no-rumble" => options.no_rumble = true,
-                "--diagnose" => options.diagnostic = true,
-                "--" => {
+                Some("--diagnose") => options.diagnostic = true,
+                Some("--") => {
                     options.command.extend(args);
                     break;
                 }
@@ -42,7 +40,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Options {
-        Options::parse(args.iter().map(|arg| arg.to_string()))
+        Options::parse(args.iter().map(OsString::from))
     }
 
     #[test]
@@ -51,14 +49,12 @@ mod tests {
             parse(&[
                 "--device",
                 "/dev/input/event7",
-                "--no-rumble",
                 "--diagnose",
                 "game",
                 "--flag"
             ]),
             Options {
                 device: Some(PathBuf::from("/dev/input/event7")),
-                no_rumble: true,
                 diagnostic: true,
                 command: vec!["game".into(), "--flag".into()],
             }
@@ -67,24 +63,39 @@ mod tests {
 
     #[test]
     fn preserves_child_options_after_command() {
-        let options = parse(&["game", "--no-rumble", "--device", "file"]);
-        assert_eq!(options.command, ["game", "--no-rumble", "--device", "file"]);
-        assert!(!options.no_rumble);
+        let options = parse(&["game", "--fullscreen", "--device", "file"]);
+        assert_eq!(
+            options.command,
+            ["game", "--fullscreen", "--device", "file"]
+        );
         assert_eq!(options.device, None);
     }
 
     #[test]
     fn launcher_arguments_after_wrapper_options_are_unchanged() {
         let options = parse(&[
-            "--device", "/dev/input/event25", "--no-rumble",
-            "umu-run", "/games/My Game.exe", "--diagnose", "--", "--device", "file",
+            "--device",
+            "/dev/input/event25",
+            "umu-run",
+            "/games/My Game.exe",
+            "--diagnose",
+            "--",
+            "--device",
+            "file",
         ]);
         assert_eq!(options.device, Some(PathBuf::from("/dev/input/event25")));
-        assert!(options.no_rumble);
         assert!(!options.diagnostic);
-        assert_eq!(options.command, [
-            "umu-run", "/games/My Game.exe", "--diagnose", "--", "--device", "file",
-        ]);
+        assert_eq!(
+            options.command,
+            [
+                "umu-run",
+                "/games/My Game.exe",
+                "--diagnose",
+                "--",
+                "--device",
+                "file",
+            ]
+        );
     }
 
     #[test]
@@ -124,8 +135,7 @@ mod tests {
 
     #[test]
     fn repeated_boolean_options_are_idempotent() {
-        let options = parse(&["--no-rumble", "--no-rumble", "--diagnose", "--diagnose"]);
-        assert!(options.no_rumble);
+        let options = parse(&["--diagnose", "--diagnose"]);
         assert!(options.diagnostic);
         assert!(options.command.is_empty());
     }
@@ -134,5 +144,32 @@ mod tests {
     fn empty_input_has_default_options() {
         assert_eq!(parse(&[]), Options::default());
         assert_eq!(parse(&["--"]), Options::default());
+    }
+}
+
+#[cfg(test)]
+mod native_argument_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn preserves_non_utf8_device_paths_and_child_arguments() {
+        let raw = OsString::from_vec(vec![b'/', b'x', 0xff]);
+        let options = Options::parse([
+            "--device".into(),
+            raw.clone(),
+            "game".into(),
+            raw.clone(),
+            "".into(),
+        ]);
+        assert_eq!(options.device, Some(PathBuf::from(&raw)));
+        assert_eq!(
+            options.command,
+            [OsString::from("game"), raw.clone(), OsString::new()]
+        );
+        assert_eq!(
+            Options::parse([raw.clone(), "--diagnose".into()]).command,
+            [raw, "--diagnose".into()]
+        );
     }
 }

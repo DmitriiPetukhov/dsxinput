@@ -1,14 +1,11 @@
 //! Runtime orchestration, event polling, and shutdown.
 use crate::{
     cli,
-    device::{gamepad_path, open_physical, supports_rumble, virtual_pad},
+    device::{gamepad_path, open_physical, require_rumble, virtual_pad},
     feedback::forward_feedback,
-    linux::{
-        eviocgabs, ioctl_ref, ioctl_val, read_event, write_event, InputAbsInfo, ABS_HAT0X,
-        ABS_HAT0Y, ABS_RX, ABS_RY, ABS_RZ, ABS_X, ABS_Y, ABS_Z, EVIOCGRAB, EVIOCRMFF,
-    },
-    mapping,
-    process::spawn_game,
+    linux::{ioctl_val, read_event, write_event, EVIOCGRAB, EVIOCRMFF},
+    process::{spawn_game, Game},
+    relay::{Relay, Snapshot},
 };
 use std::{
     env, io,
@@ -27,14 +24,15 @@ extern "C" fn handle_signal(_: libc::c_int) {
 pub(crate) fn run() -> io::Result<i32> {
     let cli::Options {
         device: path,
-        no_rumble,
         diagnostic,
         command: args,
-    } = cli::Options::parse(env::args().skip(1));
+    } = cli::Options::parse(env::args_os().skip(1));
     if args.is_empty() && !diagnostic {
-        eprintln!("dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--no-rumble] [--diagnose] COMMAND [ARGS...]\n       dsxinput --diagnose", env!("CARGO_PKG_VERSION"));
+        eprintln!("dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--diagnose] COMMAND [ARGS...]\n       dsxinput --diagnose", env!("CARGO_PKG_VERSION"));
         return Ok(2);
     }
+    // Declared first: controller resources drop before child shutdown.
+    let mut game: Option<Game> = None;
     let path = match path {
         Some(p) => p,
         None => gamepad_path()?,
@@ -42,15 +40,9 @@ pub(crate) fn run() -> io::Result<i32> {
     let physical = open_physical(&path)?;
     let pfd = physical.as_raw_fd();
     eprintln!("dsxinput: source {}", path.display());
-    let mut axisinfo = [InputAbsInfo::default(); 18];
-    for code in [
-        ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y,
-    ] {
-        let _ = ioctl_ref(pfd, eviocgabs(code), &mut axisinfo[code as usize]);
-    }
-    let rumble = !no_rumble && supports_rumble(pfd);
-    eprintln!("dsxinput: physical FF_RUMBLE supported: {rumble}");
-    let virtual_pad = virtual_pad(rumble)?;
+    require_rumble(pfd)?;
+    eprintln!("dsxinput: rumble forwarding enabled");
+    let virtual_pad = virtual_pad()?;
     let vfd = virtual_pad.as_raw_fd();
     // Exclusive evdev grab prevents most native apps seeing the original buttons; HIDRAW remains independently accessible.
     ioctl_val(pfd, EVIOCGRAB, 1)?;
@@ -72,23 +64,20 @@ pub(crate) fn run() -> io::Result<i32> {
             handle_signal as *const () as libc::sighandler_t,
         );
     }
-    let mut game = if diagnostic {
-        None
-    } else {
+    let mut relay = Relay::new(Snapshot::read(pfd)?, &mut |kind, code, value| {
+        write_event(vfd, kind, code, value)
+    })?;
+    if !diagnostic {
         thread::sleep(Duration::from_millis(800));
-        Some(spawn_game(&args)?)
-    };
+        if !STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            game = Some(Game::new(spawn_game(&args)?));
+        }
+    }
     let mut ids = [-1i16; 16];
     let started = Instant::now();
     let mut status = 0;
     loop {
         if STOP.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Some(ref mut child) = game {
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGTERM);
-                }
-                let _ = child.wait();
-            }
             break;
         }
         if let Some(ref mut child) = game {
@@ -117,17 +106,13 @@ pub(crate) fn run() -> io::Result<i32> {
             }
             return Err(e);
         }
-        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "controller disconnected",
-            ));
-        }
+        check_poll(fds[0].revents, "physical controller")?;
+        check_poll(fds[1].revents, "virtual controller")?;
         if fds[0].revents & libc::POLLIN != 0 {
             let ev = read_event(pfd)?;
-            if let Some((kind, code, value)) = mapping::translate_event(ev, &axisinfo) {
-                write_event(vfd, kind, code, value)?;
-            }
+            relay.process(ev, &mut || Snapshot::read(pfd), &mut |kind, code, value| {
+                write_event(vfd, kind, code, value)
+            })?;
         }
         if fds[1].revents & libc::POLLIN != 0 {
             let ev = read_event(vfd)?;
@@ -143,4 +128,49 @@ pub(crate) fn run() -> io::Result<i32> {
         }
     }
     Ok(status)
+}
+
+/// Check terminal poll conditions before attempting potentially blocking I/O.
+fn check_poll(events: i16, device: &str) -> io::Result<()> {
+    if events & libc::POLLNVAL != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{device}: invalid descriptor"),
+        ));
+    }
+    if events & (libc::POLLHUP | libc::POLLERR) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!("{device}: disconnected or failed"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_poll_conditions_override_readability_for_both_devices() {
+        for device in ["physical controller", "virtual controller"] {
+            for flag in [libc::POLLHUP, libc::POLLERR, libc::POLLNVAL] {
+                for readable in [0, libc::POLLIN] {
+                    let error = check_poll(flag | readable, device).unwrap_err();
+                    assert!(error.to_string().contains(device));
+                    assert_eq!(
+                        error.kind(),
+                        if flag == libc::POLLNVAL {
+                            io::ErrorKind::InvalidInput
+                        } else {
+                            io::ErrorKind::NotConnected
+                        }
+                    );
+                }
+            }
+            for flag in [0, libc::POLLIN, libc::POLLOUT] {
+                check_poll(flag, device).unwrap();
+            }
+        }
+    }
 }

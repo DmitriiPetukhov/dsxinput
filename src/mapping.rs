@@ -31,8 +31,8 @@ fn map_key(code: u16) -> Option<u16> {
     match code {
         BTN_NORTH => Some(BTN_WEST), // Triangle -> Xbox Y
         BTN_WEST => Some(BTN_NORTH), // Square -> Xbox X
-        BTN_SOUTH | BTN_EAST | BTN_TL | BTN_TR | BTN_SELECT | BTN_START
-        | BTN_MODE | BTN_THUMBL | BTN_THUMBR => Some(code),
+        BTN_SOUTH | BTN_EAST | BTN_TL | BTN_TR | BTN_SELECT | BTN_START | BTN_MODE | BTN_THUMBL
+        | BTN_THUMBR => Some(code),
         _ => None,
     }
 }
@@ -43,14 +43,16 @@ pub(crate) fn translate_event(
     axes: &[InputAbsInfo; 18],
 ) -> Option<(u16, u16, i32)> {
     match event.kind {
-        EV_KEY => map_key(event.code).map(|code| (EV_KEY, code, event.value)),
+        EV_KEY if (0..=2).contains(&event.value) => {
+            map_key(event.code).map(|code| (EV_KEY, code, event.value))
+        }
         EV_ABS => map_axis(event.code).map(|code| {
             let value = match code {
                 ABS_X | ABS_Y | ABS_RX | ABS_RY => {
                     axis_to_signed(event.value, &axes[code as usize])
                 }
                 ABS_Z | ABS_RZ => axis_to_trigger(event.value, &axes[code as usize]),
-                _ => event.value,
+                _ => event.value.clamp(-1, 1),
             };
             (EV_ABS, code, value)
         }),
@@ -260,6 +262,71 @@ mod event_tests {
             (EV_FF, 0),
         ] {
             assert_eq!(translate(kind, code, 1), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    #[test]
+    fn scaling_is_bounded_monotone_and_reaches_endpoints() {
+        for (min, max) in [
+            (0, 255),
+            (-32768, 32767),
+            (-100, 100),
+            (10, 11),
+            (i32::MIN, i32::MAX),
+        ] {
+            let info = InputAbsInfo {
+                minimum: min,
+                maximum: max,
+                ..Default::default()
+            };
+            let mut last = (-32768, 0);
+            for step in 0..=4096i64 {
+                let raw = (i64::from(min) + (i64::from(max) - i64::from(min)) * step / 4096) as i32;
+                let current = (axis_to_signed(raw, &info), axis_to_trigger(raw, &info));
+                assert!((-32768..=32767).contains(&current.0));
+                assert!((0..=255).contains(&current.1));
+                assert!(current.0 >= last.0 && current.1 >= last.1);
+                last = current;
+            }
+            assert_eq!(last, (32767, 255));
+        }
+    }
+
+    #[test]
+    fn arbitrary_event_codes_and_values_never_panic_or_escape_virtual_ranges() {
+        let axes = [InputAbsInfo {
+            minimum: 0,
+            maximum: 255,
+            ..Default::default()
+        }; 18];
+        for kind in [EV_KEY, EV_ABS, EV_SYN, u16::MAX] {
+            for code in 0..=u16::MAX {
+                for value in [i32::MIN, -1, 0, 1, 2, 255, i32::MAX] {
+                    let event = InputEvent {
+                        time: unsafe { std::mem::zeroed() },
+                        kind,
+                        code,
+                        value,
+                    };
+                    if let Some((kind, code, value)) = translate_event(event, &axes) {
+                        match kind {
+                            EV_ABS => assert!(match code {
+                                ABS_Z | ABS_RZ => (0..=255).contains(&value),
+                                ABS_HAT0X | ABS_HAT0Y => (-1..=1).contains(&value),
+                                _ => (-32768..=32767).contains(&value),
+                            }),
+                            EV_KEY => assert!((0..=2).contains(&value)),
+                            EV_SYN => assert_eq!((code, value), (SYN_REPORT, 0)),
+                            _ => panic!("unsupported output"),
+                        }
+                    }
+                }
+            }
         }
     }
 }

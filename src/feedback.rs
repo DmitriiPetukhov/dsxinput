@@ -13,15 +13,68 @@ pub(crate) fn forward_feedback(
     ev: InputEvent,
     ids: &mut [i16; 16],
 ) -> io::Result<()> {
+    forward_with(
+        &mut Kernel {
+            virtual_fd,
+            physical_fd,
+        },
+        ev,
+        ids,
+    )
+}
+
+trait FeedbackIo {
+    fn begin_upload(&mut self, upload: &mut UinputFfUpload) -> io::Result<()>;
+    fn end_upload(&mut self, upload: &mut UinputFfUpload) -> io::Result<()>;
+    fn upload(&mut self, effect: &mut crate::linux::FfEffect) -> io::Result<()>;
+    fn begin_erase(&mut self, erase: &mut UinputFfErase) -> io::Result<()>;
+    fn end_erase(&mut self, erase: &mut UinputFfErase) -> io::Result<()>;
+    fn erase(&mut self, id: i32) -> io::Result<()>;
+    fn play(&mut self, id: u16, value: i32) -> io::Result<()>;
+}
+
+struct Kernel {
+    virtual_fd: RawFd,
+    physical_fd: RawFd,
+}
+impl FeedbackIo for Kernel {
+    fn begin_upload(&mut self, u: &mut UinputFfUpload) -> io::Result<()> {
+        ioctl_ref(self.virtual_fd, UI_BEGIN_FF_UPLOAD, u)
+    }
+    fn end_upload(&mut self, u: &mut UinputFfUpload) -> io::Result<()> {
+        ioctl_ref(self.virtual_fd, UI_END_FF_UPLOAD, u)
+    }
+    fn upload(&mut self, e: &mut crate::linux::FfEffect) -> io::Result<()> {
+        ioctl_ref(self.physical_fd, EVIOCSFF, e)
+    }
+    fn begin_erase(&mut self, e: &mut UinputFfErase) -> io::Result<()> {
+        ioctl_ref(self.virtual_fd, UI_BEGIN_FF_ERASE, e)
+    }
+    fn end_erase(&mut self, e: &mut UinputFfErase) -> io::Result<()> {
+        ioctl_ref(self.virtual_fd, UI_END_FF_ERASE, e)
+    }
+    fn erase(&mut self, id: i32) -> io::Result<()> {
+        ioctl_val(self.physical_fd, EVIOCRMFF, id)
+    }
+    fn play(&mut self, id: u16, value: i32) -> io::Result<()> {
+        write_event(self.physical_fd, EV_FF, id, value)
+    }
+}
+
+fn forward_with(
+    backend: &mut impl FeedbackIo,
+    ev: InputEvent,
+    ids: &mut [i16; 16],
+) -> io::Result<()> {
     if ev.kind == EV_UINPUT && ev.code == UI_FF_UPLOAD {
         let mut u: UinputFfUpload = unsafe { zeroed() };
         u.request_id = ev.value as u32;
-        ioctl_ref(virtual_fd, UI_BEGIN_FF_UPLOAD, &mut u)?;
+        backend.begin_upload(&mut u)?;
         let slot = u.effect.id;
         if slot >= 0 && (slot as usize) < ids.len() && u.effect.type_ == FF_RUMBLE {
             let mut effect = u.effect;
             effect.id = ids[slot as usize];
-            match ioctl_ref(physical_fd, EVIOCSFF, &mut effect) {
+            match backend.upload(&mut effect) {
                 Ok(()) => {
                     ids[slot as usize] = effect.id;
                     u.retval = 0
@@ -31,17 +84,17 @@ pub(crate) fn forward_feedback(
         } else {
             u.retval = -libc::EINVAL;
         }
-        ioctl_ref(virtual_fd, UI_END_FF_UPLOAD, &mut u)?;
+        backend.end_upload(&mut u)?;
     } else if ev.kind == EV_UINPUT && ev.code == UI_FF_ERASE {
         let mut e = UinputFfErase {
             request_id: ev.value as u32,
             ..Default::default()
         };
-        ioctl_ref(virtual_fd, UI_BEGIN_FF_ERASE, &mut e)?;
+        backend.begin_erase(&mut e)?;
         let slot = e.effect_id as usize;
         if slot < ids.len() && ids[slot] >= 0 {
             let id = ids[slot];
-            match ioctl_val(physical_fd, EVIOCRMFF, id as i32) {
+            match backend.erase(id as i32) {
                 Ok(()) => {
                     ids[slot] = -1;
                     e.retval = 0
@@ -51,11 +104,11 @@ pub(crate) fn forward_feedback(
         } else {
             e.retval = -libc::EINVAL;
         }
-        ioctl_ref(virtual_fd, UI_END_FF_ERASE, &mut e)?;
+        backend.end_erase(&mut e)?;
     } else if ev.kind == EV_FF {
         let slot = ev.code as usize;
         if slot < ids.len() && ids[slot] >= 0 {
-            write_event(physical_fd, EV_FF, ids[slot] as u16, ev.value)?;
+            backend.play(ids[slot] as u16, ev.value)?;
         }
     }
     Ok(())
@@ -122,5 +175,204 @@ mod feedback_tests {
         let mut ids = [4; 16];
         let error = forward_feedback(-1, -1, event(EV_FF, 0, 1), &mut ids).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use crate::linux::FfEffect;
+
+    struct Fake {
+        slot: i16,
+        kind: u16,
+        physical_error: Option<i32>,
+        end_error: bool,
+        calls: Vec<&'static str>,
+        retval: Option<i32>,
+        previous_id: Option<i16>,
+    }
+    impl Default for Fake {
+        fn default() -> Self {
+            Self {
+                slot: 0,
+                kind: FF_RUMBLE,
+                physical_error: None,
+                end_error: false,
+                calls: Vec::new(),
+                retval: None,
+                previous_id: None,
+            }
+        }
+    }
+    impl FeedbackIo for Fake {
+        fn begin_upload(&mut self, u: &mut UinputFfUpload) -> io::Result<()> {
+            self.calls.push("begin");
+            assert_eq!(u.request_id, 42);
+            u.effect.id = self.slot;
+            u.effect.type_ = self.kind;
+            Ok(())
+        }
+        fn end_upload(&mut self, u: &mut UinputFfUpload) -> io::Result<()> {
+            self.calls.push("end");
+            self.retval = Some(u.retval);
+            if self.end_error {
+                Err(io::Error::from_raw_os_error(libc::ENODEV))
+            } else {
+                Ok(())
+            }
+        }
+        fn upload(&mut self, effect: &mut FfEffect) -> io::Result<()> {
+            self.calls.push("upload");
+            self.previous_id = Some(effect.id);
+            if let Some(errno) = self.physical_error {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            effect.id = 9;
+            Ok(())
+        }
+        fn begin_erase(&mut self, e: &mut UinputFfErase) -> io::Result<()> {
+            self.calls.push("begin");
+            assert_eq!(e.request_id, 42);
+            e.effect_id = self.slot as u32;
+            Ok(())
+        }
+        fn end_erase(&mut self, e: &mut UinputFfErase) -> io::Result<()> {
+            self.calls.push("end");
+            self.retval = Some(e.retval);
+            if self.end_error {
+                Err(io::Error::from_raw_os_error(libc::ENODEV))
+            } else {
+                Ok(())
+            }
+        }
+        fn erase(&mut self, id: i32) -> io::Result<()> {
+            self.calls.push("erase");
+            assert_eq!(id, 7);
+            if let Some(errno) = self.physical_error {
+                Err(io::Error::from_raw_os_error(errno))
+            } else {
+                Ok(())
+            }
+        }
+        fn play(&mut self, _: u16, _: i32) -> io::Result<()> {
+            panic!("unexpected playback")
+        }
+    }
+    fn request(code: u16) -> InputEvent {
+        InputEvent {
+            time: unsafe { zeroed() },
+            kind: EV_UINPUT,
+            code,
+            value: 42,
+        }
+    }
+
+    #[test]
+    fn uploads_allocate_update_and_address_every_slot() {
+        for slot in 0..16 {
+            for previous in [-1, 7] {
+                let mut io = Fake {
+                    slot,
+                    ..Default::default()
+                };
+                let mut ids = [-1; 16];
+                ids[slot as usize] = previous;
+                forward_with(&mut io, request(UI_FF_UPLOAD), &mut ids).unwrap();
+                assert_eq!(io.previous_id, Some(previous));
+                assert_eq!(io.calls, ["begin", "upload", "end"]);
+                assert_eq!(io.retval, Some(0));
+                for (index, id) in ids.iter().enumerate() {
+                    assert_eq!(*id, if index == slot as usize { 9 } else { -1 });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_uploads_complete_handshake_without_touching_physical_device() {
+        for (slot, kind) in [
+            (-1, FF_RUMBLE),
+            (16, FF_RUMBLE),
+            (i16::MAX, FF_RUMBLE),
+            (0, 0),
+        ] {
+            let mut io = Fake {
+                slot,
+                kind,
+                ..Default::default()
+            };
+            let mut ids = [7; 16];
+            forward_with(&mut io, request(UI_FF_UPLOAD), &mut ids).unwrap();
+            assert_eq!(io.calls, ["begin", "end"]);
+            assert_eq!(io.retval, Some(-libc::EINVAL));
+            assert_eq!(ids, [7; 16]);
+        }
+    }
+
+    #[test]
+    fn physical_errors_are_acknowledged_and_mapping_survives() {
+        for code in [UI_FF_UPLOAD, UI_FF_ERASE] {
+            for errno in [
+                libc::ENOSPC,
+                libc::ENODEV,
+                libc::EIO,
+                libc::EINVAL,
+                libc::EACCES,
+            ] {
+                let mut io = Fake {
+                    physical_error: Some(errno),
+                    ..Default::default()
+                };
+                let mut ids = [7; 16];
+                forward_with(&mut io, request(code), &mut ids).unwrap();
+                assert_eq!(io.retval, Some(-errno));
+                assert_eq!(io.calls.last(), Some(&"end"));
+                assert_eq!(ids, [7; 16]);
+            }
+        }
+    }
+
+    #[test]
+    fn erase_releases_only_allocated_slot_and_rejects_invalid_ids() {
+        for slot in [-1, 0, 15, 16, i16::MAX] {
+            let mut io = Fake {
+                slot,
+                ..Default::default()
+            };
+            let mut ids = [7; 16];
+            forward_with(&mut io, request(UI_FF_ERASE), &mut ids).unwrap();
+            let valid = (0..16).contains(&slot);
+            assert_eq!(io.retval, Some(if valid { 0 } else { -libc::EINVAL }));
+            for (index, id) in ids.iter().enumerate() {
+                assert_eq!(
+                    *id,
+                    if valid && index == slot as usize {
+                        -1
+                    } else {
+                        7
+                    }
+                );
+            }
+        }
+        let mut io = Fake::default();
+        let mut ids = [-1; 16];
+        forward_with(&mut io, request(UI_FF_ERASE), &mut ids).unwrap();
+        assert_eq!(io.calls, ["begin", "end"]);
+        assert_eq!(io.retval, Some(-libc::EINVAL));
+    }
+
+    #[test]
+    fn failed_acknowledgement_preserves_actual_physical_state() {
+        for code in [UI_FF_UPLOAD, UI_FF_ERASE] {
+            let mut io = Fake {
+                end_error: true,
+                ..Default::default()
+            };
+            let mut ids = [7; 16];
+            let error = forward_with(&mut io, request(code), &mut ids).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::ENODEV));
+            assert_eq!(ids[0], if code == UI_FF_UPLOAD { 9 } else { -1 });
+        }
     }
 }
