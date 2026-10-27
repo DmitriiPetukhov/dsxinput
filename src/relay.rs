@@ -18,9 +18,19 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     pub(crate) fn read(fd: RawFd) -> io::Result<Self> {
+        Self::read_with(
+            |code, info| ioctl_ref(fd, eviocgabs(code), info),
+            |keys| ioctl_ref(fd, EVIOCGKEY, keys),
+        )
+    }
+
+    fn read_with(
+        mut query_axis: impl FnMut(u16, &mut InputAbsInfo) -> io::Result<()>,
+        mut query_keys: impl FnMut(&mut [u8; 96]) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let mut axes = [InputAbsInfo::default(); 18];
         for code in AXES {
-            ioctl_ref(fd, eviocgabs(code), &mut axes[code as usize])?;
+            query_axis(code, &mut axes[code as usize])?;
             if axes[code as usize].minimum >= axes[code as usize].maximum {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -29,7 +39,7 @@ impl Snapshot {
             }
         }
         let mut keys = [0; 96];
-        ioctl_ref(fd, EVIOCGKEY, &mut keys)?;
+        query_keys(&mut keys)?;
         Ok(Self { axes, keys })
     }
 
@@ -327,5 +337,52 @@ mod failure_tests {
             })
             .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_query_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_each_invalid_axis_before_querying_buttons() {
+        for bad in AXES {
+            for (minimum, maximum) in [(0, 0), (1, 0), (i32::MAX, i32::MIN)] {
+                let result = Snapshot::read_with(
+                    |code, info| {
+                        *info = InputAbsInfo {
+                            minimum: if code == bad { minimum } else { 0 },
+                            maximum: if code == bad { maximum } else { 255 },
+                            ..Default::default()
+                        };
+                        Ok(())
+                    },
+                    |_| panic!("must reject invalid calibration first"),
+                );
+                let error = result.err().unwrap();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains(&bad.to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn query_errors_abort_at_every_axis_and_key_stage() {
+        for failure in 0..=AXES.len() {
+            let mut calls = 0;
+            let result = Snapshot::read_with(
+                |_, info| {
+                    calls += 1;
+                    if calls == failure + 1 {
+                        return Err(io::Error::from_raw_os_error(libc::ENODEV));
+                    }
+                    info.maximum = 255;
+                    Ok(())
+                },
+                |_| Err(io::Error::from_raw_os_error(libc::ENODEV)),
+            );
+            assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::ENODEV));
+            assert_eq!(calls, (failure + 1).min(AXES.len()));
+        }
     }
 }
