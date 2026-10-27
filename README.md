@@ -1,6 +1,6 @@
 # dsxinput 0.1.1
 
-Linux/Fedora wrapper: physical DualSense (Bluetooth/USB) evdev -> `uinput` virtual Xbox 360-style device (VID:PID `045e:028e`). Does not use Steam. Optional rumble forwarding uses Linux FF_RUMBLE: a game must actually submit `FF_RUMBLE` effects through the virtual evdev device. No HD haptics/adaptive triggers. Unit tests, lint checks, and a release build have been verified on Linux x86_64. Physical controller input and rumble still require hardware validation.
+Linux/Fedora wrapper: physical DualSense (Bluetooth/USB) evdev -> `uinput` virtual Xbox 360-style device (VID:PID `045e:028e`). Does not use Steam. Rumble forwarding is always enabled and uses Linux FF_RUMBLE: a game must actually submit `FF_RUMBLE` effects through the virtual evdev device. No HD haptics/adaptive triggers. Unit tests, lint checks, and a release build have been verified on Linux x86_64. Physical controller input and rumble still require hardware validation.
 
 ## Fedora installation
 
@@ -40,7 +40,6 @@ Read access to DualSense event nodes is generally granted by the login seat (see
 dsxinput --diagnose
 dsxinput gamemoderun mangohud /path/to/linux-game
 dsxinput /path/to/program arg1 arg2
-dsxinput --no-rumble /path/to/program
 dsxinput --device /dev/input/event25 /path/to/program
 ```
 
@@ -54,15 +53,15 @@ Suggested game flags to test: `PROTON_PREFER_SDL=1` (if HIDRAW picks up the orig
 
 - Single controller at a time; automatically detects Sony DualSense product IDs 054c:0ce6 and 054c:0df2 with gamepad axes.
 - Standard digital buttons, two thumbsticks, hat/d-pad, and two analog triggers. Touchpad/gyro/audio/haptics not supported.
-- For physical rumble, the kernel driver needs `FF_RUMBLE`, the input event node needs write permission, and Wine/Proton must send FF effects to the virtual evdev device.
-- Child command/process-tree lifetime varies with games and launchers. This wrapper waits for **its direct child**, not necessarily every detached Wine subprocess. Terminating wrapper sends SIGTERM to the child's process group, not every possible detached process.
-- Bluetooth disconnect currently causes wrapper to error, potentially leaving the launched game running; the virtual controller is then destroyed on exit.
+- Startup requires physical `FF_RUMBLE` support and read/write permission on the input event node. Wine/Proton must send FF effects to the virtual evdev device for vibration.
+- Child command/process-tree lifetime varies with games and launchers. This wrapper waits for **its direct child**, not necessarily every detached Wine subprocess. Terminating the wrapper sends SIGTERM, then SIGKILL if needed, to the child's process group. Detached processes outside that group are not covered.
+- Controller disconnect or input/feedback failure destroys the virtual controller, releases the physical device, and terminates the launched game process group. Shutdown allows 500 ms for SIGTERM before SIGKILL, with a further bounded reaping wait. Processes that detached into another group are outside this guarantee.
 - Device may be visible twice via HIDRAW. There is no safe universal per-game isolation implemented here.
 - No restart after Bluetooth reconnect. No multi-game concurrent access; `EVIOCGRAB` is exclusive for the selected evdev device.
 
 ## Development
 
-`main.rs` is the entry point; `app.rs` runs the event loop. The remaining modules isolate command parsing (`cli`), event translation (`mapping`), device setup (`device`), rumble forwarding (`feedback`), game launch (`process`), and the Linux ABI (`linux`).
+`main.rs` is the entry point; `app.rs` runs the event loop. The remaining modules isolate command parsing (`cli`), event translation (`mapping`), device setup (`device`), input-state synchronization (`relay`), rumble forwarding (`feedback`), game launch (`process`), and the Linux ABI (`linux`).
 
 Use test-first changes and keep each refactoring step passing:
 
@@ -72,5 +71,7 @@ cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
 ```
+
+Input state is synchronized at startup and after evdev queue overflows to restore held controls and lost releases.
 
 The tests run without controller permissions. They cover parsing, event mapping and scaling, ABI layouts, event I/O, rumble playback routing, controller identity, and child process launch. Successful kernel rumble upload/erase and controller discovery still need hardware tests.

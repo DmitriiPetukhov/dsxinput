@@ -51,12 +51,18 @@ pub(crate) fn open_physical(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
-/// Check FF_RUMBLE support; failed capability queries return false.
-pub(crate) fn supports_rumble(fd: RawFd) -> bool {
+/// Require rumble support rather than silently creating a controller without it.
+pub(crate) fn require_rumble(fd: RawFd) -> io::Result<()> {
     let mut bits = [0u8; 16];
     let req = ior(E, 0x20 + EV_FF as u64, bits.len() as u64);
-    ioctl_ref(fd, req, &mut bits).is_ok()
-        && bits[(FF_RUMBLE / 8) as usize] & (1 << (FF_RUMBLE % 8)) != 0
+    ioctl_ref(fd, req, &mut bits)?;
+    if bits[(FF_RUMBLE / 8) as usize] & (1 << (FF_RUMBLE % 8)) == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "physical controller does not support FF_RUMBLE",
+        ));
+    }
+    Ok(())
 }
 pub(crate) struct VirtualController {
     file: File,
@@ -68,8 +74,8 @@ impl Drop for VirtualController {
     }
 }
 
-/// Create a virtual Xbox controller with optional rumble support.
-pub(crate) fn virtual_pad(rumble: bool) -> io::Result<VirtualController> {
+/// Create a virtual Xbox controller with rumble support.
+pub(crate) fn virtual_pad() -> io::Result<VirtualController> {
     let f = OpenOptions::new()
         .read(true)
         .write(true)
@@ -109,11 +115,9 @@ pub(crate) fn virtual_pad(rumble: bool) -> io::Result<VirtualController> {
         };
         ioctl_ref(fd, UI_ABS_SETUP, &mut a)?;
     }
-    if rumble {
-        ioctl_val(fd, UI_SET_EVBIT, EV_FF as i32)?;
-        ioctl_val(fd, UI_SET_FFBIT, FF_RUMBLE as i32)?;
-    }
-    let mut setup = controller_setup(rumble);
+    ioctl_val(fd, UI_SET_EVBIT, EV_FF as i32)?;
+    ioctl_val(fd, UI_SET_FFBIT, FF_RUMBLE as i32)?;
+    let mut setup = controller_setup();
     ioctl_ref(fd, UI_DEV_SETUP, &mut setup)?;
     ioctl_val(fd, UI_DEV_CREATE, 0)?;
     Ok(VirtualController { file: f })
@@ -125,8 +129,8 @@ impl AsRawFd for VirtualController {
     }
 }
 
-/// Build the virtual Xbox identity and optional rumble capacity.
-fn controller_setup(rumble: bool) -> UinputSetup {
+/// Build the virtual Xbox identity and rumble capacity.
+fn controller_setup() -> UinputSetup {
     let mut setup = UinputSetup {
         id: InputId {
             bustype: 0x03,
@@ -135,7 +139,7 @@ fn controller_setup(rumble: bool) -> UinputSetup {
             version: 0x0114,
         },
         name: [0; 80],
-        ff_effects_max: if rumble { 16 } else { 0 },
+        ff_effects_max: 16,
     };
     let name = b"Xbox 360 Controller (dsxinput)";
     setup.name[..name.len()].copy_from_slice(name);
@@ -148,7 +152,7 @@ mod device_tests {
 
     #[test]
     fn virtual_controller_advertises_xbox_identity() {
-        let setup = controller_setup(false);
+        let setup = controller_setup();
         assert_eq!(
             (
                 setup.id.bustype,
@@ -163,8 +167,15 @@ mod device_tests {
     }
 
     #[test]
-    fn advertises_effect_slots_only_when_rumble_enabled() {
-        assert_eq!(controller_setup(false).ff_effects_max, 0);
-        assert_eq!(controller_setup(true).ff_effects_max, 16);
+    fn always_advertises_rumble_effect_slots() {
+        assert_eq!(controller_setup().ff_effects_max, 16);
+    }
+
+    #[test]
+    fn rumble_capability_query_preserves_kernel_errors() {
+        assert_eq!(
+            require_rumble(-1).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 }

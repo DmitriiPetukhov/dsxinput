@@ -4,7 +4,6 @@ use std::path::PathBuf;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Options {
     pub(crate) device: Option<PathBuf>,
-    pub(crate) no_rumble: bool,
     pub(crate) diagnostic: bool,
     pub(crate) command: Vec<String>,
 }
@@ -20,7 +19,6 @@ impl Options {
                 "--device" if args.peek().is_some() => {
                     options.device = args.next().map(PathBuf::from);
                 }
-                "--no-rumble" => options.no_rumble = true,
                 "--diagnose" => options.diagnostic = true,
                 "--" => {
                     options.command.extend(args);
@@ -51,14 +49,12 @@ mod tests {
             parse(&[
                 "--device",
                 "/dev/input/event7",
-                "--no-rumble",
                 "--diagnose",
                 "game",
                 "--flag"
             ]),
             Options {
                 device: Some(PathBuf::from("/dev/input/event7")),
-                no_rumble: true,
                 diagnostic: true,
                 command: vec!["game".into(), "--flag".into()],
             }
@@ -67,24 +63,39 @@ mod tests {
 
     #[test]
     fn preserves_child_options_after_command() {
-        let options = parse(&["game", "--no-rumble", "--device", "file"]);
-        assert_eq!(options.command, ["game", "--no-rumble", "--device", "file"]);
-        assert!(!options.no_rumble);
+        let options = parse(&["game", "--fullscreen", "--device", "file"]);
+        assert_eq!(
+            options.command,
+            ["game", "--fullscreen", "--device", "file"]
+        );
         assert_eq!(options.device, None);
     }
 
     #[test]
     fn launcher_arguments_after_wrapper_options_are_unchanged() {
         let options = parse(&[
-            "--device", "/dev/input/event25", "--no-rumble",
-            "umu-run", "/games/My Game.exe", "--diagnose", "--", "--device", "file",
+            "--device",
+            "/dev/input/event25",
+            "umu-run",
+            "/games/My Game.exe",
+            "--diagnose",
+            "--",
+            "--device",
+            "file",
         ]);
         assert_eq!(options.device, Some(PathBuf::from("/dev/input/event25")));
-        assert!(options.no_rumble);
         assert!(!options.diagnostic);
-        assert_eq!(options.command, [
-            "umu-run", "/games/My Game.exe", "--diagnose", "--", "--device", "file",
-        ]);
+        assert_eq!(
+            options.command,
+            [
+                "umu-run",
+                "/games/My Game.exe",
+                "--diagnose",
+                "--",
+                "--device",
+                "file",
+            ]
+        );
     }
 
     #[test]
@@ -124,8 +135,7 @@ mod tests {
 
     #[test]
     fn repeated_boolean_options_are_idempotent() {
-        let options = parse(&["--no-rumble", "--no-rumble", "--diagnose", "--diagnose"]);
-        assert!(options.no_rumble);
+        let options = parse(&["--diagnose", "--diagnose"]);
         assert!(options.diagnostic);
         assert!(options.command.is_empty());
     }

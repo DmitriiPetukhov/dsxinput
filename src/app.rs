@@ -1,7 +1,7 @@
 //! Runtime orchestration, event polling, and shutdown.
 use crate::{
     cli,
-    device::{gamepad_path, open_physical, supports_rumble, virtual_pad},
+    device::{gamepad_path, open_physical, require_rumble, virtual_pad},
     feedback::forward_feedback,
     linux::{ioctl_val, read_event, write_event, EVIOCGRAB, EVIOCRMFF},
     process::{spawn_game, Game},
@@ -24,12 +24,11 @@ extern "C" fn handle_signal(_: libc::c_int) {
 pub(crate) fn run() -> io::Result<i32> {
     let cli::Options {
         device: path,
-        no_rumble,
         diagnostic,
         command: args,
     } = cli::Options::parse(env::args().skip(1));
     if args.is_empty() && !diagnostic {
-        eprintln!("dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--no-rumble] [--diagnose] COMMAND [ARGS...]\n       dsxinput --diagnose", env!("CARGO_PKG_VERSION"));
+        eprintln!("dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--diagnose] COMMAND [ARGS...]\n       dsxinput --diagnose", env!("CARGO_PKG_VERSION"));
         return Ok(2);
     }
     // Declared first: controller resources drop before child shutdown.
@@ -41,9 +40,9 @@ pub(crate) fn run() -> io::Result<i32> {
     let physical = open_physical(&path)?;
     let pfd = physical.as_raw_fd();
     eprintln!("dsxinput: source {}", path.display());
-    let rumble = !no_rumble && supports_rumble(pfd);
-    eprintln!("dsxinput: physical FF_RUMBLE supported: {rumble}");
-    let virtual_pad = virtual_pad(rumble)?;
+    require_rumble(pfd)?;
+    eprintln!("dsxinput: rumble forwarding enabled");
+    let virtual_pad = virtual_pad()?;
     let vfd = virtual_pad.as_raw_fd();
     // Exclusive evdev grab prevents most native apps seeing the original buttons; HIDRAW remains independently accessible.
     ioctl_val(pfd, EVIOCGRAB, 1)?;
