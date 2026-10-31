@@ -294,13 +294,18 @@ pub unsafe extern "system" fn vkEnumerateInstanceExtensionProperties(
 
 #[no_mangle]
 pub unsafe extern "system" fn vkEnumerateDeviceExtensionProperties(
-    _physical_device: vk::PhysicalDevice,
+    physical_device: vk::PhysicalDevice,
     layer_name: *const c_char,
     property_count: *mut u32,
-    _properties: *mut vk::ExtensionProperties,
+    properties: *mut vk::ExtensionProperties,
 ) -> vk::Result {
     std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
-        enumerate_layer_extensions(layer_name, property_count)
+        enumerate_device_extension_properties(
+            physical_device,
+            layer_name,
+            property_count,
+            properties,
+        )
     }))
     .unwrap_or(vk::Result::ERROR_INITIALIZATION_FAILED)
 }
@@ -689,6 +694,7 @@ unsafe fn create_instance(
 }
 
 unsafe fn destroy_instance(instance: vk::Instance, allocator: *const vk::AllocationCallbacks<'_>) {
+    crate::overlay_render::remove_instance(instance);
     let next = instance_dispatch().get(&instance).copied();
     if let Some(next) = next {
         let name = c"vkDestroyInstance";
@@ -715,7 +721,7 @@ pub(crate) fn next_instance_proc_addr(
     })
 }
 
-fn next_device_proc_addr(device: vk::Device) -> Option<vk::PFN_vkGetDeviceProcAddr> {
+pub(crate) fn next_device_proc_addr(device: vk::Device) -> Option<vk::PFN_vkGetDeviceProcAddr> {
     device_dispatch().get(&device).copied()
 }
 
@@ -778,7 +784,10 @@ fn device_queue_locks(device: vk::Device) -> Vec<(u64, Arc<Mutex<()>>)> {
     locks
 }
 
-fn with_device_queue_serialization<T>(device: vk::Device, call: impl FnOnce() -> T) -> T {
+pub(crate) fn with_device_queue_serialization<T>(
+    device: vk::Device,
+    call: impl FnOnce() -> T,
+) -> T {
     let locks = device_queue_locks(device);
     let _guards = locks
         .iter()
@@ -1136,6 +1145,7 @@ unsafe fn destroy_device(device: vk::Device, allocator: *const vk::AllocationCal
         })
         .collect::<Vec<_>>();
 
+    crate::overlay_render::remove_device(device);
     if let Some(next) = next_device_proc_addr(device) {
         if let Some(function) = unsafe { next(device, c"vkDestroyDevice".as_ptr()) } {
             let destroy: vk::PFN_vkDestroyDevice = unsafe { std::mem::transmute_copy(&function) };
@@ -1194,6 +1204,34 @@ unsafe fn enumerate_layer_extensions(
     vk::Result::SUCCESS
 }
 
+unsafe fn enumerate_device_extension_properties(
+    physical_device: vk::PhysicalDevice,
+    layer_name: *const c_char,
+    property_count: *mut u32,
+    properties: *mut vk::ExtensionProperties,
+) -> vk::Result {
+    if !layer_name.is_null() {
+        return unsafe { enumerate_layer_extensions(layer_name, property_count) };
+    }
+    if property_count.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let Some(instance) = physical_device_instances().get(&physical_device).copied() else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let Some(next) = next_instance_proc_addr(instance) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let Some(function) =
+        (unsafe { next(instance, c"vkEnumerateDeviceExtensionProperties".as_ptr()) })
+    else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let enumerate: vk::PFN_vkEnumerateDeviceExtensionProperties =
+        unsafe { std::mem::transmute_copy(&function) };
+    unsafe { enumerate(physical_device, layer_name, property_count, properties) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,6 +1249,7 @@ mod tests {
     static MAX_CONCURRENT_QUEUE_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
     static QUEUE_SUBMIT2_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DESTROYED_DEVICES: AtomicUsize = AtomicUsize::new(0);
+    static DEVICE_EXTENSION_ENUMERATIONS: AtomicUsize = AtomicUsize::new(0);
     pub(crate) static DISPATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
     static SWAPCHAIN_CREATE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SWAPCHAIN_CREATE_USAGES: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -1474,6 +1513,12 @@ mod tests {
     ) -> vk::PFN_vkVoidFunction {
         if !name.is_null() {
             match unsafe { CStr::from_ptr(name) }.to_bytes() {
+                b"vkEnumerateDeviceExtensionProperties" => {
+                    return erase_function(
+                        next_enumerate_device_extensions
+                            as vk::PFN_vkEnumerateDeviceExtensionProperties,
+                    )
+                }
                 b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" => {
                     return erase_function(
                         next_surface_capabilities
@@ -1489,6 +1534,39 @@ mod tests {
             }
         }
         unsafe { next_gipa(instance, name) }
+    }
+
+    unsafe extern "system" fn next_enumerate_device_extensions(
+        _physical_device: vk::PhysicalDevice,
+        layer_name: *const c_char,
+        property_count: *mut u32,
+        properties: *mut vk::ExtensionProperties,
+    ) -> vk::Result {
+        DEVICE_EXTENSION_ENUMERATIONS.fetch_add(1, Ordering::SeqCst);
+        if !layer_name.is_null() || property_count.is_null() {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        if properties.is_null() {
+            unsafe { *property_count = 1 };
+            return vk::Result::SUCCESS;
+        }
+        if unsafe { *property_count } == 0 {
+            return vk::Result::INCOMPLETE;
+        }
+        let mut property = vk::ExtensionProperties::default();
+        for (destination, source) in property
+            .extension_name
+            .iter_mut()
+            .zip(b"VK_KHR_swapchain\0")
+        {
+            *destination = *source as c_char;
+        }
+        property.spec_version = 70;
+        unsafe {
+            *properties = property;
+            *property_count = 1;
+        }
+        vk::Result::SUCCESS
     }
 
     unsafe extern "system" fn next_create_swapchain(
@@ -2229,7 +2307,9 @@ mod tests {
             [vk::Result::SUCCESS, vk::Result::ERROR_OUT_OF_DATE_KHR]
         );
         let first_state = swapchain::state(first).unwrap();
-        assert!(first_state.enabled);
+        // Rendering setup is unavailable in this stubbed Vulkan fixture, so the layer
+        // disables only its overlay while still forwarding the successful present.
+        assert!(!first_state.enabled);
         assert!(!first_state.acquired_images.contains(&1));
         assert!(first_state.presented_images.contains(&1));
         assert!(!first_state.uncertain_images.contains(&1));
@@ -2384,6 +2464,55 @@ mod tests {
             },
             vk::Result::ERROR_LAYER_NOT_PRESENT
         );
+    }
+
+    #[test]
+    fn forwards_device_extension_enumeration_when_no_layer_name_is_requested() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let instance = vk::Instance::from_raw(0xEA01);
+        let physical_device = vk::PhysicalDevice::from_raw(0xEA02);
+        instance_dispatch().insert(instance, next_gipa_with_surface);
+        physical_device_instances().insert(physical_device, instance);
+        DEVICE_EXTENSION_ENUMERATIONS.store(0, Ordering::SeqCst);
+
+        let mut count = 0;
+        assert_eq!(
+            unsafe {
+                vkEnumerateDeviceExtensionProperties(
+                    physical_device,
+                    std::ptr::null(),
+                    &mut count,
+                    std::ptr::null_mut(),
+                )
+            },
+            vk::Result::SUCCESS
+        );
+        assert_eq!(count, 1);
+
+        let mut properties = [vk::ExtensionProperties::default()];
+        count = 1;
+        assert_eq!(
+            unsafe {
+                vkEnumerateDeviceExtensionProperties(
+                    physical_device,
+                    std::ptr::null(),
+                    &mut count,
+                    properties.as_mut_ptr(),
+                )
+            },
+            vk::Result::SUCCESS
+        );
+        assert_eq!(count, 1);
+        assert_eq!(
+            properties[0].extension_name_as_c_str().unwrap(),
+            c"VK_KHR_swapchain"
+        );
+        assert_eq!(DEVICE_EXTENSION_ENUMERATIONS.load(Ordering::SeqCst), 2);
+
+        physical_device_instances().remove(&physical_device);
+        instance_dispatch().remove(&instance);
     }
 
     #[repr(C)]

@@ -13,6 +13,8 @@ use std::{
 pub(crate) struct SwapchainState {
     pub(crate) device: vk::Device,
     instance: vk::Instance,
+    pub(crate) format: vk::Format,
+    pub(crate) extent: vk::Extent2D,
     pub(crate) enabled: bool,
     pub(crate) sharing_mode: vk::SharingMode,
     pub(crate) queue_family_indices: Vec<u32>,
@@ -41,6 +43,13 @@ fn report_disabled_once(reason: &'static str) {
     if reported.insert(reason) {
         eprintln!("dsxinput-overlay: overlay disabled: {reason}");
     }
+}
+
+pub(crate) fn disable_for_render(swapchain: vk::SwapchainKHR, reason: &'static str) {
+    if let Some(state) = swapchains().get_mut(&swapchain) {
+        state.enabled = false;
+    }
+    report_disabled_once(reason);
 }
 
 pub(crate) fn state(swapchain: vk::SwapchainKHR) -> Option<SwapchainState> {
@@ -511,6 +520,8 @@ unsafe fn create_swapchain(
                 device,
                 instance: dispatch::device_surface_context(device)
                     .map_or(vk::Instance::null(), |context| context.instance),
+                format: create_info_ref.image_format,
+                extent: create_info_ref.image_extent,
                 enabled: reason.is_none(),
                 sharing_mode: create_info_ref.image_sharing_mode,
                 queue_family_indices,
@@ -533,13 +544,17 @@ unsafe fn destroy_swapchain(
     swapchain: vk::SwapchainKHR,
     allocator: *const vk::AllocationCallbacks<'_>,
 ) {
-    if let Some(function) =
-        unsafe { dispatch::next_device_function(device, c"vkDestroySwapchainKHR") }
-    {
-        let destroy: vk::PFN_vkDestroySwapchainKHR = unsafe { std::mem::transmute_copy(&function) };
-        unsafe { destroy(device, swapchain, allocator) };
-    }
-    remove(swapchain);
+    dispatch::with_device_queue_serialization(device, || {
+        crate::overlay_render::remove_swapchain(swapchain);
+        if let Some(function) =
+            unsafe { dispatch::next_device_function(device, c"vkDestroySwapchainKHR") }
+        {
+            let destroy: vk::PFN_vkDestroySwapchainKHR =
+                unsafe { std::mem::transmute_copy(&function) };
+            unsafe { destroy(device, swapchain, allocator) };
+        }
+        remove(swapchain);
+    });
 }
 
 unsafe fn get_swapchain_images(
@@ -619,12 +634,17 @@ fn record_acquired_image(swapchain: vk::SwapchainKHR, result: vk::Result, image_
         return;
     }
     let image_index = unsafe { *image_index };
+    let mut recorded = false;
     if let Some(state) = swapchains().get_mut(&swapchain) {
         if state.images.is_empty() || (image_index as usize) < state.images.len() {
             state.acquired_images.insert(image_index);
             state.presented_images.remove(&image_index);
             state.uncertain_images.remove(&image_index);
+            recorded = true;
         }
+    }
+    if recorded {
+        crate::overlay_render::record_acquired(swapchain, image_index);
     }
 }
 
@@ -641,15 +661,22 @@ unsafe fn queue_present(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
     let present: vk::PFN_vkQueuePresentKHR = unsafe { std::mem::transmute_copy(&function) };
-    let result =
-        dispatch::with_queue_serialization(queue, || unsafe { present(queue, present_info) });
+    dispatch::with_queue_serialization(queue, || unsafe {
+        crate::overlay_render::queue_present(queue, present_info, present)
+    })
+}
+
+pub(crate) fn record_present_results(
+    present_info: *const vk::PresentInfoKHR<'_>,
+    result: vk::Result,
+) {
     if present_info.is_null() {
-        return result;
+        return;
     }
 
     let info = unsafe { &*present_info };
     if info.swapchain_count == 0 || info.p_swapchains.is_null() || info.p_image_indices.is_null() {
-        return result;
+        return;
     }
 
     let mut has_uncertain_result = false;
@@ -685,5 +712,4 @@ unsafe fn queue_present(
     if has_uncertain_result {
         report_disabled_once("swapchain presentation left image synchronization uncertain");
     }
-    result
 }
