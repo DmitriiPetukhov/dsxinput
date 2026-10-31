@@ -1,21 +1,19 @@
-use std::{thread, time::Duration};
+use std::error::Error;
 
-use crate::controllers::{self, ControllerTracker};
+use crate::controllers::ControllerTracker;
 
 pub fn run() {
-    let mut tracker = match ControllerTracker::new() {
-        Ok(tracker) => tracker,
-        Err(error) => {
-            eprintln!("Failed to initialize controller tracking: {error}");
-            return;
-        }
-    };
+    if let Err(error) = track_controllers() {
+        eprintln!("Controller tracking failed: {error}");
+    }
+}
+
+fn track_controllers() -> Result<(), Box<dyn Error>> {
+    let mut tracker = ControllerTracker::new()?;
+
+    tracker.update()?;
 
     loop {
-        if let Err(error) = tracker.update() {
-            eprintln!("Failed to refresh controllers: {error}");
-        }
-
-        thread::sleep(Duration::from_millis(500));
+        tracker.wait_for_change()?;
     }
 }

@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 hidapi = "2.6.7"
+nix = { version = "0.31.3", features = ["poll"] }
+udev = "0.9.3"

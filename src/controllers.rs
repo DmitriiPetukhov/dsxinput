@@ -1,6 +1,7 @@
-use std::{collections::HashSet, ffi::CString};
+use std::{collections::HashSet, error::Error, ffi::CString, os::fd::AsFd};
 
 use hidapi::{HidApi, HidError};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const SONY_VENDOR_ID: u16 = 0x054c;
 const DUALSENSE_PRODUCT_ID: u16 = 0x0ce6;
@@ -9,14 +10,43 @@ const DUALSENSE_EDGE_PRODUCT_ID: u16 = 0x0df2;
 pub struct ControllerTracker {
     api: HidApi,
     connected: HashSet<CString>,
+    monitor: udev::MonitorSocket,
 }
 
 impl ControllerTracker {
-    pub fn new() -> Result<Self, HidError> {
+    pub fn new() -> Result<Self, Box<dyn Error>> {
+        let monitor = udev::MonitorBuilder::new()?
+            .match_subsystem("hidraw")?
+            .listen()?;
+
         Ok(Self {
             api: HidApi::new()?,
             connected: HashSet::new(),
+            monitor,
         })
+    }
+
+    pub fn wait_for_change(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut fds = [PollFd::new(self.monitor.as_fd(), PollFlags::POLLIN)];
+
+        loop {
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => break,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let events = fds[0].revents().unwrap_or(PollFlags::empty());
+        if events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+            return Err(std::io::Error::other("udev monitor socket failed").into());
+        }
+
+        // Drain the queued events before rescanning.
+        for _event in self.monitor.iter() {}
+
+        self.update()?;
+        Ok(())
     }
 
     pub fn update(&mut self) -> Result<(), HidError> {
