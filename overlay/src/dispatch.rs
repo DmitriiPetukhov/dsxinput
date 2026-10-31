@@ -1272,6 +1272,10 @@ mod tests {
     static PRESENT_PNEXT: AtomicUsize = AtomicUsize::new(0);
     static PRESENT_RESULTS: AtomicUsize = AtomicUsize::new(0);
     static SURFACE_COLOR_ATTACHMENT_SUPPORTED: AtomicUsize = AtomicUsize::new(1);
+    static SURFACE_TRANSFER_SRC_SUPPORTED: AtomicUsize = AtomicUsize::new(1);
+    static HDR_SCENE_IMAGE_SUPPORTED: AtomicUsize = AtomicUsize::new(1);
+    static HDR_UI_IMAGE_SUPPORTED: AtomicUsize = AtomicUsize::new(1);
+    static HDR_UI_BLEND_SUPPORTED: AtomicUsize = AtomicUsize::new(1);
 
     unsafe extern "system" fn next_gipa(
         _instance: vk::Instance,
@@ -1530,6 +1534,17 @@ mod tests {
                         next_surface_support as vk::PFN_vkGetPhysicalDeviceSurfaceSupportKHR,
                     )
                 }
+                b"vkGetPhysicalDeviceFormatProperties" => {
+                    return erase_function(
+                        next_format_properties as vk::PFN_vkGetPhysicalDeviceFormatProperties,
+                    )
+                }
+                b"vkGetPhysicalDeviceImageFormatProperties" => {
+                    return erase_function(
+                        next_image_format_properties
+                            as vk::PFN_vkGetPhysicalDeviceImageFormatProperties,
+                    )
+                }
                 _ => {}
             }
         }
@@ -1694,14 +1709,65 @@ mod tests {
         }
         unsafe {
             *capabilities = vk::SurfaceCapabilitiesKHR::default().supported_usage_flags(
-                vk::ImageUsageFlags::TRANSFER_SRC
-                    | if SURFACE_COLOR_ATTACHMENT_SUPPORTED.load(Ordering::SeqCst) != 0 {
-                        vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    } else {
-                        vk::ImageUsageFlags::empty()
-                    },
+                (if SURFACE_COLOR_ATTACHMENT_SUPPORTED.load(Ordering::SeqCst) != 0 {
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                } else {
+                    vk::ImageUsageFlags::empty()
+                }) | (if SURFACE_TRANSFER_SRC_SUPPORTED.load(Ordering::SeqCst) != 0 {
+                    vk::ImageUsageFlags::TRANSFER_SRC
+                } else {
+                    vk::ImageUsageFlags::empty()
+                }),
             )
         };
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn next_format_properties(
+        _physical_device: vk::PhysicalDevice,
+        _format: vk::Format,
+        properties: *mut vk::FormatProperties,
+    ) {
+        if properties.is_null() {
+            return;
+        }
+        let mut optimal_tiling_features = vk::FormatFeatureFlags::empty();
+        if HDR_UI_IMAGE_SUPPORTED.load(Ordering::SeqCst) != 0 {
+            optimal_tiling_features |=
+                vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        }
+        if HDR_UI_BLEND_SUPPORTED.load(Ordering::SeqCst) != 0 {
+            optimal_tiling_features |= vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+        }
+        unsafe {
+            *properties =
+                vk::FormatProperties::default().optimal_tiling_features(optimal_tiling_features)
+        };
+    }
+
+    unsafe extern "system" fn next_image_format_properties(
+        _physical_device: vk::PhysicalDevice,
+        _format: vk::Format,
+        _image_type: vk::ImageType,
+        _tiling: vk::ImageTiling,
+        usage: vk::ImageUsageFlags,
+        _flags: vk::ImageCreateFlags,
+        properties: *mut vk::ImageFormatProperties,
+    ) -> vk::Result {
+        if properties.is_null() {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        if usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
+            && HDR_SCENE_IMAGE_SUPPORTED.load(Ordering::SeqCst) == 0
+        {
+            return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
+        }
+        if usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            && HDR_UI_IMAGE_SUPPORTED.load(Ordering::SeqCst) == 0
+        {
+            return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
+        }
+        unsafe { *properties = vk::ImageFormatProperties::default() };
         vk::Result::SUCCESS
     }
 
@@ -1869,6 +1935,10 @@ mod tests {
         PRESENT_PNEXT.store(0, Ordering::SeqCst);
         PRESENT_RESULTS.store(0, Ordering::SeqCst);
         SURFACE_COLOR_ATTACHMENT_SUPPORTED.store(1, Ordering::SeqCst);
+        SURFACE_TRANSFER_SRC_SUPPORTED.store(1, Ordering::SeqCst);
+        HDR_SCENE_IMAGE_SUPPORTED.store(1, Ordering::SeqCst);
+        HDR_UI_IMAGE_SUPPORTED.store(1, Ordering::SeqCst);
+        HDR_UI_BLEND_SUPPORTED.store(1, Ordering::SeqCst);
         (device, queue, surface)
     }
 
@@ -2039,6 +2109,169 @@ mod tests {
             original_usage.as_raw()
         );
         assert!(!swapchain::state(new_swapchain).unwrap().enabled);
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn hdr_swapchain_usage_is_added_and_recorded_for_supported_pairs() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        let expected_usage = vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSFER_SRC;
+
+        for (format, color_space, expected_mode) in [
+            (
+                vk::Format::A2B10G10R10_UNORM_PACK32,
+                vk::ColorSpaceKHR::HDR10_ST2084_EXT,
+                crate::hdr::OutputColorMode::Hdr10Pq,
+            ),
+            (
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT,
+                crate::hdr::OutputColorMode::ScRgbLinear,
+            ),
+        ] {
+            let mut info = base_swapchain_create_info(surface);
+            info.image_format = format;
+            info.image_color_space = color_space;
+            let original_usage = info.image_usage;
+            let (result, swapchain) = unsafe { call_create_swapchain(device, &info) };
+
+            assert_eq!(result, vk::Result::SUCCESS);
+            assert_eq!(
+                SWAPCHAIN_CREATE_LAST_USAGE.load(Ordering::SeqCst) as u32,
+                expected_usage.as_raw()
+            );
+            let state = swapchain::state(swapchain).expect("registered HDR swapchain");
+            assert!(state.enabled);
+            assert_eq!(state.output_color_mode, Some(expected_mode));
+            assert!(state.color_space == color_space);
+            assert_eq!(state.image_usage.as_raw(), expected_usage.as_raw());
+            assert_ne!(original_usage.as_raw(), state.image_usage.as_raw());
+        }
+
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn hdr_swapchain_requires_surface_transfer_src_support() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        SURFACE_TRANSFER_SRC_SUPPORTED.store(0, Ordering::SeqCst);
+        let mut info = base_swapchain_create_info(surface);
+        info.image_format = vk::Format::A2B10G10R10_UNORM_PACK32;
+        info.image_color_space = vk::ColorSpaceKHR::HDR10_ST2084_EXT;
+        let original_usage = info.image_usage;
+        let (result, swapchain) = unsafe { call_create_swapchain(device, &info) };
+
+        assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(SWAPCHAIN_CREATE_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            SWAPCHAIN_CREATE_LAST_USAGE.load(Ordering::SeqCst) as u32,
+            original_usage.as_raw()
+        );
+        let state = swapchain::state(swapchain).expect("registered unsupported HDR swapchain");
+        assert!(!state.enabled);
+        assert_eq!(state.image_usage.as_raw(), original_usage.as_raw());
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn hdr_swapchain_requires_supported_scene_and_ui_images() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        for (unsupported_resource, scene_supported, ui_image_supported, ui_blend_supported) in
+            [(0, 0, 1, 1), (1, 1, 0, 1), (2, 1, 1, 0)]
+        {
+            HDR_SCENE_IMAGE_SUPPORTED.store(scene_supported, Ordering::SeqCst);
+            HDR_UI_IMAGE_SUPPORTED.store(ui_image_supported, Ordering::SeqCst);
+            HDR_UI_BLEND_SUPPORTED.store(ui_blend_supported, Ordering::SeqCst);
+            let mut info = base_swapchain_create_info(surface);
+            info.image_format = vk::Format::A2B10G10R10_UNORM_PACK32;
+            info.image_color_space = vk::ColorSpaceKHR::HDR10_ST2084_EXT;
+            let original_usage = info.image_usage;
+            let (result, swapchain) = unsafe { call_create_swapchain(device, &info) };
+
+            assert_eq!(result, vk::Result::SUCCESS);
+            assert_eq!(
+                SWAPCHAIN_CREATE_CALLS.load(Ordering::SeqCst),
+                unsupported_resource + 1
+            );
+            assert_eq!(
+                SWAPCHAIN_CREATE_LAST_USAGE.load(Ordering::SeqCst) as u32,
+                original_usage.as_raw()
+            );
+            let state = swapchain::state(swapchain).expect("registered unsupported HDR swapchain");
+            assert!(!state.enabled);
+            assert_eq!(state.image_usage.as_raw(), original_usage.as_raw());
+        }
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn hdr_usage_fallback_and_old_swapchain_follow_safe_creation_policy() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        let mut info = base_swapchain_create_info(surface);
+        info.image_format = vk::Format::A2B10G10R10_UNORM_PACK32;
+        info.image_color_space = vk::ColorSpaceKHR::HDR10_ST2084_EXT;
+        let original_usage = info.image_usage;
+        SWAPCHAIN_FAIL_ADDED_USAGE.store(1, Ordering::SeqCst);
+        let (fallback_result, fallback_swapchain) = unsafe { call_create_swapchain(device, &info) };
+
+        assert_eq!(fallback_result, vk::Result::SUCCESS);
+        assert_eq!(SWAPCHAIN_CREATE_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            SWAPCHAIN_CREATE_USAGES[0].load(Ordering::SeqCst) as u32,
+            (original_usage
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC)
+                .as_raw()
+        );
+        assert_eq!(
+            SWAPCHAIN_CREATE_USAGES[1].load(Ordering::SeqCst) as u32,
+            original_usage.as_raw()
+        );
+        let fallback = swapchain::state(fallback_swapchain).expect("registered fallback swapchain");
+        assert!(!fallback.enabled);
+        assert_eq!(fallback.image_usage.as_raw(), original_usage.as_raw());
+
+        SWAPCHAIN_FAIL_ADDED_USAGE.store(0, Ordering::SeqCst);
+        let mut old_info = base_swapchain_create_info(surface);
+        old_info.image_format = vk::Format::A2B10G10R10_UNORM_PACK32;
+        old_info.image_color_space = vk::ColorSpaceKHR::HDR10_ST2084_EXT;
+        let (old_result, old_swapchain) = unsafe { call_create_swapchain(device, &old_info) };
+        assert_eq!(old_result, vk::Result::SUCCESS);
+        let mut recreation = old_info;
+        recreation.old_swapchain = old_swapchain;
+        let (recreate_result, new_swapchain) =
+            unsafe { call_create_swapchain(device, &recreation) };
+
+        assert_eq!(recreate_result, vk::Result::SUCCESS);
+        assert_eq!(SWAPCHAIN_CREATE_CALLS.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            SWAPCHAIN_CREATE_LAST_USAGE.load(Ordering::SeqCst) as u32,
+            recreation.image_usage.as_raw()
+        );
+        let recreated = swapchain::state(new_swapchain).expect("registered recreated swapchain");
+        assert!(!recreated.enabled);
+        assert_eq!(
+            recreated.image_usage.as_raw(),
+            recreation.image_usage.as_raw()
+        );
         cleanup_swapchain_device(device, queue, instance);
     }
 

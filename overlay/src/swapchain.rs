@@ -17,6 +17,9 @@ pub(crate) struct SwapchainState {
     pub(crate) device: vk::Device,
     instance: vk::Instance,
     pub(crate) format: vk::Format,
+    pub(crate) color_space: vk::ColorSpaceKHR,
+    pub(crate) output_color_mode: Option<OutputColorMode>,
+    pub(crate) image_usage: vk::ImageUsageFlags,
     pub(crate) extent: vk::Extent2D,
     pub(crate) enabled: bool,
     pub(crate) sharing_mode: vk::SharingMode,
@@ -300,6 +303,8 @@ pub(crate) unsafe extern "system" fn vkQueuePresentKHR(
 }
 
 struct Eligibility {
+    output_color_mode: Option<OutputColorMode>,
+    required_usage: vk::ImageUsageFlags,
     present_families: HashSet<u32>,
     disable_reason: Option<&'static str>,
 }
@@ -309,63 +314,186 @@ unsafe fn evaluate_eligibility(
     create_info: &vk::SwapchainCreateInfoKHR<'_>,
 ) -> Eligibility {
     if create_info.image_array_layers != 1 {
-        return disabled("swapchain has more than one image layer");
+        return disabled(
+            "swapchain has more than one image layer",
+            classify_output_color_mode(create_info.image_format, create_info.image_color_space),
+        );
     }
-    if !matches!(
-        classify_output_color_mode(create_info.image_format, create_info.image_color_space),
-        Some(OutputColorMode::Sdr)
-    ) {
-        return disabled("swapchain color space and format are unsupported or HDR");
-    }
+    let output_color_mode =
+        classify_output_color_mode(create_info.image_format, create_info.image_color_space);
+    let Some(output_color_mode) = output_color_mode else {
+        return disabled(
+            "swapchain color space and format are unsupported",
+            output_color_mode,
+        );
+    };
     if create_info
         .flags
         .contains(vk::SwapchainCreateFlagsKHR::PROTECTED)
     {
-        return disabled("protected swapchains are unsupported");
+        return disabled(
+            "protected swapchains are unsupported",
+            Some(output_color_mode),
+        );
     }
     if matches!(
         create_info.present_mode,
         vk::PresentModeKHR::SHARED_DEMAND_REFRESH | vk::PresentModeKHR::SHARED_CONTINUOUS_REFRESH
     ) {
-        return disabled("shared-present modes are unsupported");
+        return disabled(
+            "shared-present modes are unsupported",
+            Some(output_color_mode),
+        );
     }
     let queue_family_indices = match sharing_family_indices(create_info) {
         Ok(indices) => indices,
-        Err(reason) => return disabled(reason),
+        Err(reason) => return disabled(reason, Some(output_color_mode)),
     };
     let Some(context) = dispatch::device_surface_context(device) else {
-        return disabled("device queue-family state is unavailable");
+        return disabled(
+            "device queue-family state is unavailable",
+            Some(output_color_mode),
+        );
     };
     let Some(capabilities) = (unsafe { surface_capabilities(&context, create_info.surface) })
     else {
-        return disabled("surface capabilities query failed");
+        return disabled("surface capabilities query failed", Some(output_color_mode));
     };
-    if !capabilities
-        .supported_usage_flags
-        .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-    {
-        return disabled("surface does not support color-attachment images");
+    let required_usage = required_swapchain_usage(output_color_mode);
+    if !capabilities.supported_usage_flags.contains(required_usage) {
+        return disabled(
+            match output_color_mode {
+                OutputColorMode::Sdr => "surface does not support color-attachment images",
+                OutputColorMode::Hdr10Pq | OutputColorMode::ScRgbLinear => {
+                    "surface does not support HDR color-attachment and transfer-source images"
+                }
+            },
+            Some(output_color_mode),
+        );
+    }
+    if matches!(
+        output_color_mode,
+        OutputColorMode::Hdr10Pq | OutputColorMode::ScRgbLinear
+    ) {
+        if let Err(reason) =
+            unsafe { validate_hdr_image_support(&context, create_info.image_format) }
+        {
+            return disabled(reason, Some(output_color_mode));
+        }
     }
     let present_families = match unsafe {
         surface_present_families(&context, create_info.surface, &queue_family_indices)
     } {
         Ok(families) => families,
-        Err(reason) => return disabled(reason),
+        Err(reason) => return disabled(reason, Some(output_color_mode)),
     };
     if present_families.is_empty() {
-        return disabled("no requested graphics queue can present to the surface");
+        return disabled(
+            "no requested graphics queue can present to the surface",
+            Some(output_color_mode),
+        );
     }
     Eligibility {
+        output_color_mode: Some(output_color_mode),
+        required_usage,
         present_families,
         disable_reason: None,
     }
 }
 
-fn disabled(reason: &'static str) -> Eligibility {
+fn required_swapchain_usage(output_color_mode: OutputColorMode) -> vk::ImageUsageFlags {
+    match output_color_mode {
+        OutputColorMode::Sdr => vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        OutputColorMode::Hdr10Pq | OutputColorMode::ScRgbLinear => {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+        }
+    }
+}
+
+fn disabled(reason: &'static str, output_color_mode: Option<OutputColorMode>) -> Eligibility {
     Eligibility {
+        output_color_mode,
+        required_usage: output_color_mode
+            .map_or(vk::ImageUsageFlags::empty(), required_swapchain_usage),
         present_families: HashSet::new(),
         disable_reason: Some(reason),
     }
+}
+
+unsafe fn validate_hdr_image_support(
+    context: &dispatch::DeviceSurfaceContext,
+    swapchain_format: vk::Format,
+) -> Result<(), &'static str> {
+    let Some(next) = dispatch::next_instance_proc_addr(context.instance) else {
+        return Err("instance dispatch is unavailable for HDR format queries");
+    };
+    let Some(image_format_function) = (unsafe {
+        next(
+            context.instance,
+            c"vkGetPhysicalDeviceImageFormatProperties".as_ptr(),
+        )
+    }) else {
+        return Err("HDR image-format query is unavailable");
+    };
+    let image_format_properties: vk::PFN_vkGetPhysicalDeviceImageFormatProperties =
+        unsafe { std::mem::transmute_copy(&image_format_function) };
+    for (format, usage, failure_reason) in [
+        (
+            swapchain_format,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            "swapchain format cannot be used for the HDR scene copy",
+        ),
+        (
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            "float UI image usage is unsupported",
+        ),
+    ] {
+        let mut properties = vk::ImageFormatProperties::default();
+        let result = unsafe {
+            image_format_properties(
+                context.physical_device,
+                format,
+                vk::ImageType::TYPE_2D,
+                vk::ImageTiling::OPTIMAL,
+                usage,
+                vk::ImageCreateFlags::empty(),
+                &mut properties,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            return Err(failure_reason);
+        }
+    }
+
+    let Some(format_function) = (unsafe {
+        next(
+            context.instance,
+            c"vkGetPhysicalDeviceFormatProperties".as_ptr(),
+        )
+    }) else {
+        return Err("HDR format-feature query is unavailable");
+    };
+    let format_properties: vk::PFN_vkGetPhysicalDeviceFormatProperties =
+        unsafe { std::mem::transmute_copy(&format_function) };
+    let mut properties = vk::FormatProperties::default();
+    unsafe {
+        format_properties(
+            context.physical_device,
+            vk::Format::R16G16B16A16_SFLOAT,
+            &mut properties,
+        )
+    };
+    let required_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    if !properties
+        .optimal_tiling_features
+        .contains(required_features)
+    {
+        return Err("float UI format lacks color, blend, or sampling support");
+    }
+    Ok(())
 }
 
 fn sharing_family_indices(
@@ -477,27 +605,29 @@ unsafe fn create_swapchain(
     let create_info_ref = unsafe { &*create_info };
     let queue_family_indices = sharing_family_indices(create_info_ref).unwrap_or_default();
     let mut eligibility = unsafe { evaluate_eligibility(device, create_info_ref) };
+    let mut actual_image_usage = create_info_ref.image_usage;
     let needs_usage = eligibility.disable_reason.is_none()
         && !create_info_ref
             .image_usage
-            .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+            .contains(eligibility.required_usage);
 
     let result = if needs_usage && create_info_ref.old_swapchain.is_null() {
         let mut extended = *create_info_ref;
-        extended.image_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        extended.image_usage |= eligibility.required_usage;
         let result = unsafe { create(device, &extended, allocator, swapchain) };
         if result == vk::Result::SUCCESS {
+            actual_image_usage = extended.image_usage;
             result
         } else {
             unsafe { *swapchain = vk::SwapchainKHR::null() };
-            eligibility.disable_reason = Some("color attachment usage was rejected");
+            eligibility.disable_reason = Some("required overlay image usage was rejected");
             eligibility.present_families.clear();
             unsafe { create(device, create_info, allocator, swapchain) }
         }
     } else {
         if needs_usage {
             eligibility.disable_reason =
-                Some("old swapchain recreation cannot safely add color-attachment usage");
+                Some("old swapchain recreation cannot safely add required overlay image usage");
             eligibility.present_families.clear();
         }
         unsafe { create(device, create_info, allocator, swapchain) }
@@ -512,6 +642,9 @@ unsafe fn create_swapchain(
                 instance: dispatch::device_surface_context(device)
                     .map_or(vk::Instance::null(), |context| context.instance),
                 format: create_info_ref.image_format,
+                color_space: create_info_ref.image_color_space,
+                output_color_mode: eligibility.output_color_mode,
+                image_usage: actual_image_usage,
                 extent: create_info_ref.image_extent,
                 enabled: reason.is_none(),
                 sharing_mode: create_info_ref.image_sharing_mode,
