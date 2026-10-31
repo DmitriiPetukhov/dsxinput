@@ -1,9 +1,12 @@
-use std::error::Error;
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    error::Error,
+    path::PathBuf,
+};
 
 use crate::{
     controller_tracker::{ControllerEvent, ControllerTracker, LinuxControllerSource},
-    virtual_gamepad::VirtualGamepad,
-    virtual_gamepad_manager::VirtualGamepadManager,
+    gamepad_session::GamepadSession,
 };
 
 pub fn run() {
@@ -14,17 +17,24 @@ pub fn run() {
 
 fn track_controllers() -> Result<(), Box<dyn Error>> {
     let mut tracker = ControllerTracker::new(LinuxControllerSource::new()?)?;
-    let mut manager = VirtualGamepadManager::new(VirtualGamepad::new);
+    let mut sessions: HashMap<PathBuf, GamepadSession> = HashMap::new();
 
     tracker.run(|event| match event {
-        ControllerEvent::Connected(path) => match manager.create(&path) {
-            Ok(()) => println!("Controller connected: {path:?}"),
-            Err(error) => {
-                eprintln!("Failed to create virtual gamepad for {path:?}: {error}");
+        ControllerEvent::Connected(path) => {
+            if let Entry::Vacant(entry) = sessions.entry(path.clone()) {
+                match GamepadSession::new(&path) {
+                    Ok(session) => {
+                        entry.insert(session);
+                        println!("Controller connected: {path:?}");
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to create session for {path:?}: {error}");
+                    }
+                }
             }
-        },
+        }
         ControllerEvent::Disconnected(path) => {
-            manager.remove(&path);
+            sessions.remove(&path);
             println!("Controller disconnected: {path:?}");
         }
     })
