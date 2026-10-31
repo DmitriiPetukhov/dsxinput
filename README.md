@@ -10,13 +10,27 @@ That's what dsxinput does. It wraps the game command, creates a virtual Xbox 360
 
 ## Installation (Fedora)
 
-### Dependencies and device access
+### Build requirements and device access
 
-Install the build tools:
+Build with Rust 1.95 or newer and Cargo. Check the installed versions with `rustc --version` and `cargo --version`. A C compiler is required for native dependencies, and `curl` is used by the rustup installer:
 
 ```sh
-sudo dnf install rust cargo gcc
+sudo dnf install gcc curl
 ```
+
+If you do not have a Rust toolchain at version 1.95 or newer, install [rustup](https://rust-lang.org/tools/install/) and select the stable toolchain:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+rustup toolchain install stable
+rustup default stable
+rustc --version
+```
+
+Confirm that `rustc --version` reports 1.95 or newer before building.
+
+The Vulkan overlay also needs the system Vulkan loader and a working graphics driver. Install `vkcube` if you want to run the overlay smoke check.
 
 Enable `uinput` and allow your local desktop session to access it:
 
@@ -36,11 +50,17 @@ Log out and back in if the permission change does not take effect. Your user als
 From the project directory:
 
 ```sh
-cargo build --release --locked
-install -Dm755 target/release/dsxinput "$HOME/.local/bin/dsxinput"
+cargo build --workspace --release --locked
+./install.sh
 ```
 
-Make sure `~/.local/bin` is in your `PATH` to use the commands below.
+The installer puts `dsxinput` in `~/.local/bin` and the Vulkan layer library and manifest in `~/.local/lib/dsxinput`. Set `PREFIX` to install under another prefix:
+
+```sh
+PREFIX="$HOME/.local-alt" ./install.sh
+```
+
+Make sure the selected prefix's `bin` directory is in your `PATH` to use the commands below. You can also run the installer harness with `sh tests/install.sh`.
 
 ## Usage
 
@@ -54,12 +74,23 @@ dsxinput /path/to/game --fullscreen
 
 Arguments after the game command are passed through unchanged. You can connect your DualSense over USB or Bluetooth before or during the game.
 
+### Show the Vulkan version overlay
+
+Pass `--debug` before the game command to enable the version overlay for that child process:
+
+```sh
+dsxinput --debug vkcube
+dsxinput --debug /path/to/game --fullscreen
+```
+
+The first command is a smoke check when `vkcube` is installed. The overlay is loaded only for the launched game; a normal `dsxinput GAME` launch does not enable it.
+
 ### With GameMode and MangoHud
 
 With both tools installed:
 
 ```sh
-dsxinput gamemoderun mangohud /path/to/game
+dsxinput --debug gamemoderun mangohud /path/to/game
 ```
 
 ### In Faugus Launcher
@@ -67,10 +98,16 @@ dsxinput gamemoderun mangohud /path/to/game
 For a native installation of [Faugus Launcher](https://github.com/Faugus/faugus-launcher), edit the game's **Launch Arguments** field and enter the absolute path to dsxinput:
 
 ```text
-/home/your-user/.local/bin/dsxinput
+/home/your-user/.local/bin/dsxinput --debug
 ```
 
-Replace `/home/your-user` with your home directory. Faugus adds the game command automatically; no `%command%` placeholder is needed. You can enable GameMode and MangoHud through Faugus as usual—they run after dsxinput.
+Replace `/home/your-user` with your home directory. Faugus adds the game command automatically; no `%command%` placeholder is needed. Remove `--debug` if you do not want the Vulkan overlay. You can enable GameMode and MangoHud through Faugus as usual—they run after dsxinput.
+
+### Vulkan overlay support
+
+The layer targets Linux x86_64, including 64-bit native Vulkan games and Wine/Proton games using DXVK or VKD3D-Proton. DXVK/VKD3D compatibility is a target and has not yet been verified with real games. `vkcube` smoke checks confirm the layer can draw on this system, but do not establish compatibility with a particular game.
+
+The layer applies only to Vulkan. It supports single-layer SDR color-attachment swapchains where graphics and presentation use the same queue family. OpenGL games do not use the layer; 32-bit processes and Flatpak installs are unsupported. The layer skips unsupported swapchain modes such as HDR or separate graphics/presentation queue families and logs a diagnostic.
 
 ## How it works
 
@@ -90,7 +127,7 @@ The virtual controller should exist before the game starts. Check the dsxinput o
 
 ### Permission denied for /dev/uinput
 
-Follow the `uinput` setup steps under [Dependencies and device access](#dependencies-and-device-access). Log out and back in if the permission change does not take effect.
+Follow the `uinput` setup steps under [Build requirements and device access](#build-requirements-and-device-access). Log out and back in if the permission change does not take effect.
 
 ### The game receives duplicate input
 
