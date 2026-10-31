@@ -2,6 +2,10 @@
 
 Use DualSense and DualSense Edge controllers as virtual Xbox 360-style gamepads on Linux, without Steam Input. Supports multiple controllers over USB or Bluetooth.
 
+Valve's Steam Input makes this easy: it can emulate an XInput controller for games that don't support DualSense directly. But for games bought elsewhere and run through other launchers, that usually means adding them to Steam first and enabling Steam Input there. I wanted something simpler—a command you can add to a game's launch settings, with controller emulation running only for that game.
+
+That's what dsxinput does. It wraps the game command, creates a virtual Xbox 360-style controller, and removes it when the command exits. No Steam required.
+
 ## Install (Fedora)
 
 Install build dependencies, then run the installer from the project directory:
