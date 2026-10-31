@@ -1,11 +1,11 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
-    ffi::{CStr, CString},
     io,
+    path::PathBuf,
 };
 
 pub struct VirtualGamepadManager<G, F> {
-    gamepads: HashMap<CString, G>,
+    gamepads: HashMap<PathBuf, G>,
     create_gamepad: F,
 }
 
@@ -16,7 +16,7 @@ impl<G, F: FnMut(&str) -> io::Result<G>> VirtualGamepadManager<G, F> {
             create_gamepad,
         }
     }
-    pub fn create(&mut self, path: &CStr) -> io::Result<()> {
+    pub fn create(&mut self, path: &PathBuf) -> io::Result<()> {
         if let Entry::Vacant(entry) = self.gamepads.entry(path.to_owned()) {
             let gamepad = (self.create_gamepad)(&path.to_string_lossy())?;
             entry.insert(gamepad);
@@ -25,7 +25,7 @@ impl<G, F: FnMut(&str) -> io::Result<G>> VirtualGamepadManager<G, F> {
         Ok(())
     }
 
-    pub fn remove(&mut self, path: &CStr) {
+    pub fn remove(&mut self, path: &PathBuf) {
         self.gamepads.remove(path);
     }
 }
@@ -35,8 +35,8 @@ mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
 
-    fn path(value: &str) -> CString {
-        CString::new(value).unwrap()
+    fn path(value: &str) -> PathBuf {
+        PathBuf::from(value)
     }
 
     struct FakeGamepad {

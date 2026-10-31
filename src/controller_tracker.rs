@@ -1,6 +1,6 @@
-use std::{collections::HashSet, error::Error, ffi::CString, os::fd::AsFd};
+use std::{collections::HashSet, error::Error, os::fd::AsFd, path::PathBuf};
 
-use hidapi::HidApi;
+use evdev::{AbsoluteAxisCode, KeyCode};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const SONY_VENDOR_ID: u16 = 0x054c;
@@ -9,13 +9,13 @@ const DUALSENSE_EDGE_PRODUCT_ID: u16 = 0x0df2;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ControllerEvent {
-    Connected(CString),
-    Disconnected(CString),
+    Connected(PathBuf),
+    Disconnected(PathBuf),
 }
 
 #[derive(Default)]
 struct ControllerTrackerState {
-    connected: HashSet<CString>,
+    connected: HashSet<PathBuf>,
 }
 
 impl ControllerTrackerState {
@@ -25,7 +25,7 @@ impl ControllerTrackerState {
         }
     }
 
-    fn update(&mut self, current: HashSet<CString>) -> Vec<ControllerEvent> {
+    fn update(&mut self, current: HashSet<PathBuf>) -> Vec<ControllerEvent> {
         let mut events = Vec::new();
         for path in current.difference(&self.connected) {
             events.push(ControllerEvent::Connected(path.clone()));
@@ -42,41 +42,49 @@ impl ControllerTrackerState {
 
 #[cfg_attr(test, mockall::automock)]
 pub(crate) trait ControllerSource {
-    fn scan(&mut self) -> Result<HashSet<CString>, Box<dyn Error>>;
+    fn scan(&mut self) -> Result<HashSet<PathBuf>, Box<dyn Error>>;
 
     fn wait_for_change(&mut self) -> Result<(), Box<dyn Error>>;
 }
 
 pub(crate) struct LinuxControllerSource {
-    api: HidApi,
     monitor: udev::MonitorSocket,
 }
 
 impl LinuxControllerSource {
     pub(crate) fn new() -> Result<Self, Box<dyn Error>> {
         let monitor = udev::MonitorBuilder::new()?
-            .match_subsystem("hidraw")?
+            .match_subsystem("input")?
             .listen()?;
 
-        return Ok(Self {
-            api: HidApi::new()?,
-            monitor,
-        });
+        return Ok(Self { monitor });
     }
 }
 
 impl ControllerSource for LinuxControllerSource {
-    fn scan(&mut self) -> Result<HashSet<CString>, Box<dyn Error>> {
-        self.api.refresh_devices()?;
+    fn scan(&mut self) -> Result<HashSet<PathBuf>, Box<dyn Error>> {
+        let mut paths = HashSet::new();
 
-        let current = self
-            .api
-            .device_list()
-            .filter(|device| is_dualsense(device.vendor_id(), device.product_id()))
-            .map(|device| device.path().to_owned())
-            .collect();
+        for (path, device) in evdev::enumerate() {
+            let id = device.input_id();
+            if !is_dualsense(id.vendor(), id.product()) {
+                continue;
+            }
 
-        return Ok(current);
+            let has_buttons = device
+                .supported_keys()
+                .is_some_and(|keys| keys.contains(KeyCode::BTN_SOUTH));
+
+            let has_sticks = device.supported_absolute_axes().is_some_and(|axes| {
+                axes.contains(AbsoluteAxisCode::ABS_X) && axes.contains(AbsoluteAxisCode::ABS_Y)
+            });
+
+            if has_buttons && has_sticks {
+                paths.insert(path);
+            }
+        }
+
+        Ok(paths)
     }
 
     fn wait_for_change(&mut self) -> Result<(), Box<dyn Error>> {
@@ -140,19 +148,16 @@ mod tests {
     mod state {
         use super::*;
 
-        fn paths(values: &[&str]) -> HashSet<CString> {
-            values
-                .iter()
-                .map(|value| CString::new(*value).unwrap())
-                .collect()
+        fn paths(values: &[&str]) -> HashSet<PathBuf> {
+            values.iter().map(|value| PathBuf::from(*value)).collect()
         }
 
         fn connected(path: &str) -> ControllerEvent {
-            ControllerEvent::Connected(CString::new(path).unwrap())
+            ControllerEvent::Connected(PathBuf::from(path))
         }
 
         fn disconnected(path: &str) -> ControllerEvent {
-            ControllerEvent::Disconnected(CString::new(path).unwrap())
+            ControllerEvent::Disconnected(PathBuf::from(path))
         }
 
         fn assert_events(actual: Vec<ControllerEvent>, expected: Vec<ControllerEvent>) {
@@ -277,7 +282,7 @@ mod tests {
                 .expect_scan()
                 .times(1)
                 .in_sequence(&mut sequence)
-                .returning(|| Ok(HashSet::from([CString::new("a").unwrap()])));
+                .returning(|| Ok(HashSet::from([PathBuf::from("a")])));
             source
                 .expect_wait_for_change()
                 .times(1)
@@ -285,7 +290,7 @@ mod tests {
                 .returning_st(move || {
                     assert_eq!(
                         *observed.borrow(),
-                        vec![ControllerEvent::Connected(CString::new("a").unwrap())]
+                        vec![ControllerEvent::Connected(PathBuf::from("a"))]
                     );
                     Err(failure("wait failed"))
                 });
@@ -307,12 +312,7 @@ mod tests {
                     .expect_scan()
                     .times(1)
                     .in_sequence(&mut sequence)
-                    .returning(move || {
-                        Ok(paths
-                            .iter()
-                            .map(|path| CString::new(*path).unwrap())
-                            .collect())
-                    });
+                    .returning(move || Ok(paths.iter().map(|path| PathBuf::from(*path)).collect()));
                 source
                     .expect_wait_for_change()
                     .times(1)
@@ -333,9 +333,9 @@ mod tests {
             assert_eq!(
                 events,
                 vec![
-                    ControllerEvent::Connected(CString::new("a").unwrap()),
-                    ControllerEvent::Disconnected(CString::new("a").unwrap()),
-                    ControllerEvent::Connected(CString::new("a").unwrap()),
+                    ControllerEvent::Connected(PathBuf::from("a")),
+                    ControllerEvent::Disconnected(PathBuf::from("a")),
+                    ControllerEvent::Connected(PathBuf::from("a")),
                 ]
             );
         }
