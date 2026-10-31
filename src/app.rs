@@ -3,6 +3,7 @@ use crate::{
     cli,
     device::{gamepad_path, open_physical, require_rumble, virtual_pad, VirtualController},
     feedback::FeedbackState,
+    layer::LayerArtifacts,
     linux::{ioctl_val, read_event, write_event, EVIOCGRAB},
     process::{spawn_game, Game},
     relay::{neutralize, Relay, Snapshot},
@@ -172,7 +173,31 @@ impl Runtime for SystemRuntime {
         if self.stopped() {
             return Ok(());
         }
-        self.game = Some(Game::new(spawn_game(&self.options.command)?));
+        let overlay = if self.options.debug {
+            match env::current_exe() {
+                Ok(executable) => match LayerArtifacts::discover_from(&executable) {
+                    Ok(Some(layer)) => Some(layer),
+                    Ok(None) => {
+                        eprintln!("dsxinput: --debug requested, but Vulkan overlay artifacts were not found; launching without the overlay");
+                        None
+                    }
+                    Err(error) => {
+                        eprintln!("dsxinput: --debug requested, but Vulkan overlay discovery failed: {error}; launching without the overlay");
+                        None
+                    }
+                },
+                Err(error) => {
+                    eprintln!("dsxinput: --debug requested, but the executable path could not be determined: {error}; launching without the overlay");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.game = Some(Game::new(spawn_game(
+            &self.options.command,
+            overlay.as_ref(),
+        )?));
         Ok(())
     }
     fn exit_status(&mut self) -> io::Result<Option<i32>> {

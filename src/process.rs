@@ -1,5 +1,7 @@
 //! Launch the game in an isolated process group.
+use crate::layer::LayerArtifacts;
 use std::{
+    env,
     ffi::OsString,
     io,
     os::unix::process::CommandExt,
@@ -7,7 +9,7 @@ use std::{
 };
 
 /// Inherit the terminal and create a process group for shutdown signaling.
-pub(crate) fn spawn_game(args: &[OsString]) -> io::Result<Child> {
+pub(crate) fn spawn_game(args: &[OsString], overlay: Option<&LayerArtifacts>) -> io::Result<Child> {
     let (program, arguments) = args
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "game command is empty"))?;
@@ -16,6 +18,11 @@ pub(crate) fn spawn_game(args: &[OsString]) -> io::Result<Child> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    if let Err(error) = apply_overlay_environment(&mut cmd, overlay) {
+        eprintln!(
+            "dsxinput: cannot configure Vulkan overlay environment: {error}; launching without the overlay"
+        );
+    }
     cmd.process_group(0);
     cmd.spawn()
 }
@@ -104,14 +111,17 @@ mod process_tests {
     #[test]
     fn forwards_child_arguments_and_exit_status() {
         let args = ["/bin/sh", "-c", "exit \"$1\"", "game", "7"].map(OsString::from);
-        assert_eq!(spawn_game(&args).unwrap().wait().unwrap().code(), Some(7));
+        assert_eq!(
+            spawn_game(&args, None).unwrap().wait().unwrap().code(),
+            Some(7)
+        );
     }
 
     #[test]
     fn missing_executable_returns_not_found() {
         let args = [OsString::from("/nonexistent/dsxinput-test-game")];
         assert_eq!(
-            spawn_game(&args).unwrap_err().kind(),
+            spawn_game(&args, None).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
     }
@@ -119,7 +129,7 @@ mod process_tests {
     #[test]
     fn child_has_its_own_process_group() {
         let args = ["/bin/sleep", "30"].map(OsString::from);
-        let mut child = spawn_game(&args).unwrap();
+        let mut child = spawn_game(&args, None).unwrap();
         let pid = child.id() as i32;
         let group = unsafe { libc::getpgid(pid) };
         // Reap the test process before asserting, including on a group mismatch.
@@ -136,10 +146,46 @@ mod empty_command_tests {
     #[test]
     fn empty_command_is_an_input_error() {
         assert_eq!(
-            spawn_game(&[]).unwrap_err().kind(),
+            spawn_game(&[], None).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }
+}
+
+#[cfg(test)]
+mod overlay_environment_tests {
+    use super::*;
+
+    #[test]
+    fn no_overlay_does_not_change_child_environment() {
+        let mut command = Command::new("true");
+        let before = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect::<Vec<_>>();
+
+        apply_overlay_environment(&mut command, None).unwrap();
+
+        let after = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
+    }
+}
+
+fn apply_overlay_environment(
+    command: &mut Command,
+    overlay: Option<&LayerArtifacts>,
+) -> io::Result<()> {
+    let Some(overlay) = overlay else {
+        return Ok(());
+    };
+    let updates = overlay.environment_updates(|name| env::var_os(name))?;
+    for (name, value) in updates {
+        command.env(name, value);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

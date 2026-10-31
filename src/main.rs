@@ -3,6 +3,7 @@ mod app;
 mod cli;
 mod device;
 mod feedback;
+mod layer;
 mod linux;
 mod mapping;
 mod process;
