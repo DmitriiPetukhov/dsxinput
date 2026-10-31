@@ -20,12 +20,18 @@ pub struct GamepadSession {
 }
 
 impl GamepadSession {
-    pub fn new(path: &Path) -> io::Result<Self> {
+    pub fn new(path: &Path, stick_deadzone_l: f32, stick_deadzone_r: f32) -> io::Result<Self> {
         let physical_gamepad = PhysicalGamepad::open(path)?;
         let virtual_gamepad = VirtualGamepad::new(&path.to_string_lossy())?;
 
         Self::spawn_worker(format!("gamepad-session {path:?}"), move |shutdown| {
-            Self::worker(physical_gamepad, virtual_gamepad, shutdown)
+            Self::worker(
+                physical_gamepad,
+                virtual_gamepad,
+                shutdown,
+                stick_deadzone_l,
+                stick_deadzone_r,
+            )
         })
     }
 
@@ -126,13 +132,27 @@ impl GamepadSession {
         mut physical_gamepad: PhysicalGamepad,
         mut virtual_gamepad: VirtualGamepad,
         shutdown_receiver: UnixStream,
+        stick_deadzone_l: f32,
+        stick_deadzone_r: f32,
     ) -> io::Result<()> {
         let mut events_frame = Vec::new();
         let mut stick_filters = [
-            (AbsoluteAxisCode::ABS_X, StickAxisFilter::new(0.1)),
-            (AbsoluteAxisCode::ABS_Y, StickAxisFilter::new(0.1)),
-            (AbsoluteAxisCode::ABS_RX, StickAxisFilter::new(0.1)),
-            (AbsoluteAxisCode::ABS_RY, StickAxisFilter::new(0.1)),
+            (
+                AbsoluteAxisCode::ABS_X,
+                StickAxisFilter::new(stick_deadzone_l),
+            ),
+            (
+                AbsoluteAxisCode::ABS_Y,
+                StickAxisFilter::new(stick_deadzone_l),
+            ),
+            (
+                AbsoluteAxisCode::ABS_RX,
+                StickAxisFilter::new(stick_deadzone_r),
+            ),
+            (
+                AbsoluteAxisCode::ABS_RY,
+                StickAxisFilter::new(stick_deadzone_r),
+            ),
         ];
 
         loop {

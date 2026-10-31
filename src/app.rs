@@ -3,17 +3,18 @@ use std::{error::Error, io, os::fd::AsFd};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::{
-    cli::Cli, controller_tracker::ControllerTracker, game_process::GameProcess,
-    gamepad_session_manager::GamepadSessionManager,
+    cli::Cli, controller_tracker::ControllerTracker, env_config::EnvConfig,
+    game_process::GameProcess, gamepad_session_manager::GamepadSessionManager,
 };
 
 pub(crate) struct App {
     cli: Cli,
+    config: EnvConfig,
 }
 
 impl App {
-    pub fn new(cli: Cli) -> Self {
-        Self { cli }
+    pub fn new(cli: Cli, config: EnvConfig) -> Self {
+        Self { cli, config }
     }
 
     pub fn run(&self) {
@@ -24,7 +25,8 @@ impl App {
 
     fn run_event_loop(&self) -> Result<(), Box<dyn Error>> {
         let mut tracker = ControllerTracker::new()?;
-        let mut sessions = GamepadSessionManager::new();
+        let mut sessions =
+            GamepadSessionManager::new(self.config.stick_deadzone_l, self.config.stick_deadzone_r);
         sessions.handle_controller_events(tracker.update()?);
         let mut game = if self.cli.standalone {
             None

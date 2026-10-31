@@ -47,9 +47,25 @@ Faugus supplies the game command automatically. No `%command%` or extra `--` is 
 
 For games launched through Steam, use Steam Input instead of dsxinput. Enable Steam Input in the game's controller settings.
 
+## Configuration
+
+Configure stick deadzones through environment variables:
+
+| Variable | Description | Default |
+|---|---|---|
+| `DSXINPUT_STICK_DEADZONE_L` | Left stick axial deadzone | `0.1` (10%) |
+| `DSXINPUT_STICK_DEADZONE_R` | Right stick axial deadzone | `0.1` (10%) |
+
+Values must be finite numbers from `0` (inclusive) to `1` (exclusive). Invalid values stop startup.
+
+For example:
+
+```sh
+DSXINPUT_STICK_DEADZONE_L=0.05 DSXINPUT_STICK_DEADZONE_R=0.15 dsxinput --standalone
+```
+
 ## Limitations
 
-- Sticks have a 10% axial deadzone. Disconnecting and reconnecting creates a new virtual gamepad.
 - Rumble, adaptive triggers, advanced haptics, touchpad, and gyro are not supported.
 - Physical controllers remain visible to games, which can cause duplicate input.
 - Session failures are logged; reconnect the controller to retry. Input frames are currently printed for debugging.
