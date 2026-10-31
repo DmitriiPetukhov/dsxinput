@@ -14,3 +14,6 @@ crate-type = ["cdylib"]
 ash.workspace = true
 egui.workspace = true
 egui-ash-renderer.workspace = true
+
+[build-dependencies]
+naga = { version = "=29.0.1", default-features = false, features = ["wgsl-in", "spv-out"] }
