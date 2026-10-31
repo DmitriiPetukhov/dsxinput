@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+evdev = "0.13.2"
 hidapi = "2.6.7"
 nix = { version = "0.31.3", features = ["poll"] }
 udev = "0.9.3"
+
+[dev-dependencies]
+mockall = "0.15.0"
