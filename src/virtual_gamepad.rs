@@ -102,6 +102,10 @@ pub struct VirtualGamepad {
 }
 
 impl VirtualGamepad {
+    pub fn emit(&mut self, events: &[evdev::InputEvent]) -> io::Result<()> {
+        self._device.emit(events)
+    }
+
     pub fn new(name: &str) -> io::Result<Self> {
         let definition = &GAMEPAD_DEFINITION;
         let mut buttons = AttributeSet::<KeyCode>::new();

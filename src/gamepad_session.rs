@@ -5,7 +5,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use evdev::{AbsoluteAxisCode, EventType, InputEvent, SynchronizationCode};
+use evdev::{AbsoluteAxisCode, EventType, InputEvent, KeyCode, SynchronizationCode};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::{
@@ -67,9 +67,64 @@ impl GamepadSession {
         }
     }
 
+    /// Translate DualSense evdev events to the declared virtual Xbox layout.
+    /// Physical stick and trigger ranges are assumed to be 0..=255.
+    fn map_event(event: &InputEvent) -> Option<InputEvent> {
+        let value = match event.event_type() {
+            EventType::KEY => match KeyCode(event.code()) {
+                // DualSense evdev labels Square as NORTH and Triangle as WEST.
+                KeyCode::BTN_NORTH => {
+                    return Some(InputEvent::new(
+                        EventType::KEY.0,
+                        KeyCode::BTN_WEST.0,
+                        event.value(),
+                    ));
+                }
+                KeyCode::BTN_WEST => {
+                    return Some(InputEvent::new(
+                        EventType::KEY.0,
+                        KeyCode::BTN_NORTH.0,
+                        event.value(),
+                    ));
+                }
+                KeyCode::BTN_SOUTH
+                | KeyCode::BTN_EAST
+                | KeyCode::BTN_TL
+                | KeyCode::BTN_TR
+                | KeyCode::BTN_SELECT
+                | KeyCode::BTN_START
+                | KeyCode::BTN_MODE
+                | KeyCode::BTN_THUMBL
+                | KeyCode::BTN_THUMBR => event.value(),
+                _ => return None,
+            },
+            EventType::ABSOLUTE => match AbsoluteAxisCode(event.code()) {
+                AbsoluteAxisCode::ABS_X
+                | AbsoluteAxisCode::ABS_Y
+                | AbsoluteAxisCode::ABS_RX
+                | AbsoluteAxisCode::ABS_RY => {
+                    let raw = event.value().clamp(0, 255);
+                    if raw <= 128 {
+                        (raw - 128) * 32768 / 128
+                    } else {
+                        (raw - 128) * 32767 / 127
+                    }
+                }
+                AbsoluteAxisCode::ABS_Z | AbsoluteAxisCode::ABS_RZ => event.value().clamp(0, 255),
+                AbsoluteAxisCode::ABS_HAT0X | AbsoluteAxisCode::ABS_HAT0Y => {
+                    event.value().clamp(-1, 1)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+
+        Some(InputEvent::new(event.event_type().0, event.code(), value))
+    }
+
     fn worker(
         mut physical_gamepad: PhysicalGamepad,
-        _virtual_gamepad: VirtualGamepad,
+        mut virtual_gamepad: VirtualGamepad,
         shutdown_receiver: UnixStream,
     ) -> io::Result<()> {
         let mut events_frame = Vec::new();
@@ -123,6 +178,11 @@ impl GamepadSession {
                             if is_report {
                                 if !events_frame.is_empty() {
                                     println!("[{}] {events_frame:?}", physical_gamepad.name());
+                                    let mapped: Vec<_> =
+                                        events_frame.iter().filter_map(Self::map_event).collect();
+                                    if !mapped.is_empty() {
+                                        virtual_gamepad.emit(&mapped)?;
+                                    }
                                     events_frame.clear();
                                 }
                             } else {
