@@ -23,21 +23,13 @@ pub fn run() {
 fn track_controllers() -> Result<(), Box<dyn Error>> {
     let mut tracker = ControllerTracker::new()?;
     let mut sessions: HashMap<PathBuf, GamepadSession> = HashMap::new();
-    let (exit_sender, exit_receiver) = mpsc::channel::<SessionExit>();
 
     loop {
-        while let Ok(exit) = exit_receiver.try_recv() {
-            if let Err(error) = exit.result {
-                sessions.remove(&exit.path);
-                eprintln!("Controller session failed for {:?}: {error}", exit.path);
-            }
-        }
-
         for event in tracker.update()? {
             match event {
                 ControllerEvent::Connected(path) => {
                     if let Entry::Vacant(entry) = sessions.entry(path.clone()) {
-                        match GamepadSession::new(&path, exit_sender.clone()) {
+                        match GamepadSession::new(&path) {
                             Ok(session) => {
                                 entry.insert(session);
                                 println!("Controller connected: {path:?}");
@@ -55,8 +47,18 @@ fn track_controllers() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        {
-            let mut fds = [PollFd::new(tracker.as_fd(), PollFlags::POLLIN)];
+        let failed_paths = {
+            let paths: Vec<PathBuf> = sessions.keys().cloned().collect();
+
+            let mut fds = Vec::with_capacity(paths.len() + 1);
+            fds.push(PollFd::new(tracker.as_fd(), PollFlags::POLLIN));
+
+            for path in &paths {
+                fds.push(PollFd::new(
+                    sessions[path].exit_socket().as_fd(),
+                    PollFlags::POLLIN,
+                ));
+            }
 
             loop {
                 match poll(&mut fds, PollTimeout::NONE) {
@@ -66,10 +68,36 @@ fn track_controllers() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            let events = fds[0].revents().unwrap_or(PollFlags::empty());
-
-            if events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+            let failure = PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL;
+            let hotplug_events = fds[0].revents().unwrap_or(PollFlags::empty());
+            if hotplug_events.intersects(failure) {
                 return Err(io::Error::other("udev monitor failed").into());
+            }
+
+            let mut failed_paths = Vec::new();
+            for (path, fd) in paths.iter().zip(fds.iter().skip(1)) {
+                let events = fd.revents().unwrap_or(PollFlags::empty());
+
+                if (events.intersects(PollFlags::POLLIN | failure)) {
+                    failed_paths.push(path.clone());
+                }
+            }
+
+            failed_paths
+        };
+
+        for path in failed_paths {
+            if let Some(session) = sessions.remove(&path) {
+                match session.read_failure() {
+                    Ok(error) => {
+                        eprintln!("Controller session failed for {path:?}: {error}");
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to read session failure for {path:?}: {error}");
+                    }
+                }
+
+                drop(session);
             }
         }
 
