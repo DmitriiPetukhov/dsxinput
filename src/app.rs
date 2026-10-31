@@ -4,14 +4,13 @@ use std::{
     io,
     os::fd::AsFd,
     path::PathBuf,
-    sync::mpsc,
 };
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::{
     controller_tracker::{ControllerEvent, ControllerTracker},
-    gamepad_session::{GamepadSession, SessionExit},
+    gamepad_session::GamepadSession,
 };
 
 pub fn run() {
@@ -47,7 +46,7 @@ fn track_controllers() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        let failed_paths = {
+        let finished_paths = {
             let paths: Vec<PathBuf> = sessions.keys().cloned().collect();
 
             let mut fds = Vec::with_capacity(paths.len() + 1);
@@ -74,30 +73,23 @@ fn track_controllers() -> Result<(), Box<dyn Error>> {
                 return Err(io::Error::other("udev monitor failed").into());
             }
 
-            let mut failed_paths = Vec::new();
+            let mut finished_paths = Vec::new();
             for (path, fd) in paths.iter().zip(fds.iter().skip(1)) {
                 let events = fd.revents().unwrap_or(PollFlags::empty());
 
-                if (events.intersects(PollFlags::POLLIN | failure)) {
-                    failed_paths.push(path.clone());
+                if events.intersects(PollFlags::POLLIN | failure) {
+                    finished_paths.push(path.clone());
                 }
             }
 
-            failed_paths
+            finished_paths
         };
 
-        for path in failed_paths {
+        for path in finished_paths {
             if let Some(session) = sessions.remove(&path) {
-                match session.read_failure() {
-                    Ok(error) => {
-                        eprintln!("Controller session failed for {path:?}: {error}");
-                    }
-                    Err(error) => {
-                        eprintln!("Failed to read session failure for {path:?}: {error}");
-                    }
+                if let Err(error) = session.finish() {
+                    eprintln!("Controller session failed for {path:?}: {error}");
                 }
-
-                drop(session);
             }
         }
 
