@@ -7,6 +7,12 @@ const SONY_VENDOR_ID: u16 = 0x054c;
 const DUALSENSE_PRODUCT_ID: u16 = 0x0ce6;
 const DUALSENSE_EDGE_PRODUCT_ID: u16 = 0x0df2;
 
+#[derive(Debug)]
+pub enum ControllerEvent {
+    Connected(CString),
+    Disconnected(CString),
+}
+
 pub struct ControllerTracker {
     api: HidApi,
     connected: HashSet<CString>,
@@ -26,7 +32,17 @@ impl ControllerTracker {
         })
     }
 
-    pub fn wait_for_change(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn run(&mut self, mut on_event: impl FnMut(ControllerEvent)) -> Result<(), Box<dyn Error>> {
+        loop {
+            for event in self.update()? {
+                on_event(event);
+            }
+
+            self.wait_for_change()?;
+        }
+    }
+
+    fn wait_for_change(&mut self) -> Result<(), Box<dyn Error>> {
         let mut fds = [PollFd::new(self.monitor.as_fd(), PollFlags::POLLIN)];
 
         loop {
@@ -45,11 +61,10 @@ impl ControllerTracker {
         // Drain the queued events before rescanning.
         for _event in self.monitor.iter() {}
 
-        self.update()?;
         Ok(())
     }
 
-    pub fn update(&mut self) -> Result<(), HidError> {
+    fn update(&mut self) -> Result<Vec<ControllerEvent>, HidError> {
         self.api.refresh_devices()?;
 
         let current: HashSet<CString> = self
@@ -59,16 +74,18 @@ impl ControllerTracker {
             .map(|device| device.path().to_owned())
             .collect();
 
+        let mut events = Vec::new();
+
         for path in current.difference(&self.connected) {
-            println!("Controller connected: {path:?}");
+            events.push(ControllerEvent::Connected(path.clone()));
         }
 
         for path in self.connected.difference(&current) {
-            println!("Controller disconnected: {path:?}");
+            events.push(ControllerEvent::Disconnected(path.clone()));
         }
 
         self.connected = current;
-        Ok(())
+        Ok(events)
     }
 }
 

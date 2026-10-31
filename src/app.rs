@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use crate::controllers::ControllerTracker;
+use crate::controllers::{ControllerEvent, ControllerTracker};
 
 pub fn run() {
     if let Err(error) = track_controllers() {
@@ -11,9 +11,12 @@ pub fn run() {
 fn track_controllers() -> Result<(), Box<dyn Error>> {
     let mut tracker = ControllerTracker::new()?;
 
-    tracker.update()?;
-
-    loop {
-        tracker.wait_for_change()?;
-    }
+    tracker.run(|event| match event {
+        ControllerEvent::Connected(path) => {
+            println!("Controller connected: {path:?}");
+        }
+        ControllerEvent::Disconnected(path) => {
+            println!("Controller disconnected: {path:?}");
+        }
+    })
 }
