@@ -757,10 +757,291 @@ fn function_pointer(function: vk::PFN_vkVoidFunction) -> *const c_void {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Used by the HDR render path once its regional pass is connected.
+struct PanelArea {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[allow(dead_code)] // Used by the HDR render path once its regional pass is connected.
+fn panel_area_from_primitives(
+    primitives: &[egui::ClippedPrimitive],
+    pixels_per_point: f32,
+    swapchain_extent: vk::Extent2D,
+) -> Option<PanelArea> {
+    if !pixels_per_point.is_finite()
+        || pixels_per_point <= 0.0
+        || swapchain_extent.width == 0
+        || swapchain_extent.height == 0
+    {
+        return None;
+    }
+
+    let mut panel_bounds: Option<egui::Rect> = None;
+    for clipped in primitives {
+        let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive else {
+            continue;
+        };
+        if mesh.indices.len() < 3 || !mesh.is_valid() || !clip_rect_is_usable(clipped.clip_rect) {
+            continue;
+        }
+
+        let mut mesh_bounds: Option<egui::Rect> = None;
+        for index in &mesh.indices {
+            let Some(vertex) = mesh.vertices.get(*index as usize) else {
+                continue;
+            };
+            let position = vertex.pos;
+            if !position.x.is_finite() || !position.y.is_finite() {
+                continue;
+            }
+            let point_bounds = egui::Rect::from_min_max(position, position);
+            mesh_bounds =
+                Some(mesh_bounds.map_or(point_bounds, |bounds| bounds.union(point_bounds)));
+        }
+        let Some(mesh_bounds) = mesh_bounds else {
+            continue;
+        };
+        let visible_bounds = mesh_bounds.intersect(clipped.clip_rect);
+        if !visible_bounds.is_positive() {
+            continue;
+        }
+        panel_bounds =
+            Some(panel_bounds.map_or(visible_bounds, |bounds| bounds.union(visible_bounds)));
+    }
+
+    let bounds = panel_bounds?;
+    let x0 = pixel_bound(
+        bounds.min.x * pixels_per_point,
+        swapchain_extent.width,
+        false,
+    )?;
+    let y0 = pixel_bound(
+        bounds.min.y * pixels_per_point,
+        swapchain_extent.height,
+        false,
+    )?;
+    let x1 = pixel_bound(
+        bounds.max.x * pixels_per_point,
+        swapchain_extent.width,
+        true,
+    )?;
+    let y1 = pixel_bound(
+        bounds.max.y * pixels_per_point,
+        swapchain_extent.height,
+        true,
+    )?;
+    (x1 > x0 && y1 > y0).then_some(PanelArea {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
+}
+
+fn pixel_bound(value: f32, limit: u32, round_up: bool) -> Option<u32> {
+    if value.is_nan() {
+        return None;
+    }
+    let value = value.clamp(0.0, limit as f32);
+    Some(if round_up {
+        value.ceil() as u32
+    } else {
+        value.floor() as u32
+    })
+}
+
+fn clip_rect_is_usable(rect: egui::Rect) -> bool {
+    !rect.min.x.is_nan()
+        && !rect.min.y.is_nan()
+        && !rect.max.x.is_nan()
+        && !rect.max.y.is_nan()
+        && rect.min.x <= rect.max.x
+        && rect.min.y <= rect.max.y
+}
+
+#[allow(dead_code)] // Used by the HDR render path once its regional pass is connected.
+fn localize_primitives(
+    primitives: &[egui::ClippedPrimitive],
+    area: PanelArea,
+    pixels_per_point: f32,
+) -> Vec<egui::ClippedPrimitive> {
+    if !pixels_per_point.is_finite()
+        || pixels_per_point <= 0.0
+        || area.width == 0
+        || area.height == 0
+    {
+        return Vec::new();
+    }
+
+    let origin = egui::vec2(
+        area.x as f32 / pixels_per_point,
+        area.y as f32 / pixels_per_point,
+    );
+    let local_screen_rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(
+            area.width as f32 / pixels_per_point,
+            area.height as f32 / pixels_per_point,
+        ),
+    );
+
+    primitives
+        .iter()
+        .filter_map(|clipped| {
+            let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive else {
+                return None;
+            };
+            if mesh.indices.len() < 3 || !mesh.is_valid() || !clip_rect_is_usable(clipped.clip_rect)
+            {
+                return None;
+            }
+
+            let mut localized = clipped.clone();
+            localized.clip_rect = localized
+                .clip_rect
+                .translate(-origin)
+                .intersect(local_screen_rect);
+            if !localized.clip_rect.is_positive() {
+                return None;
+            }
+            if let egui::epaint::Primitive::Mesh(mesh) = &mut localized.primitive {
+                for vertex in &mut mesh.vertices {
+                    vertex.pos -= origin;
+                }
+            }
+            Some(localized)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::write_failed_present_results;
+    use super::{
+        localize_primitives, panel_area_from_primitives, write_failed_present_results, PanelArea,
+    };
     use ash::vk::{self, Handle};
+
+    fn mesh_primitive(vertices: [[f32; 2]; 3], clip_rect: egui::Rect) -> egui::ClippedPrimitive {
+        let vertices = vertices.map(|[x, y]| egui::epaint::Vertex {
+            pos: egui::pos2(x, y),
+            ..Default::default()
+        });
+        let mesh = egui::epaint::Mesh {
+            indices: vec![0, 1, 2],
+            vertices: vertices.to_vec(),
+            ..Default::default()
+        };
+        egui::ClippedPrimitive {
+            clip_rect,
+            primitive: egui::epaint::Primitive::Mesh(mesh),
+        }
+    }
+
+    fn extent(width: u32, height: u32) -> vk::Extent2D {
+        vk::Extent2D { width, height }
+    }
+
+    #[test]
+    fn panel_area_uses_mesh_bounds_intersected_with_clip_rect() {
+        let primitive = mesh_primitive(
+            [[-2.0, -2.0], [10.0, -2.0], [-2.0, 10.0]],
+            egui::Rect::from_min_max(egui::pos2(2.0, 3.0), egui::pos2(6.0, 7.0)),
+        );
+
+        let area = panel_area_from_primitives(&[primitive], 1.0, extent(30, 20)).unwrap();
+
+        assert_eq!((area.x, area.y, area.width, area.height), (2, 3, 4, 4));
+    }
+
+    #[test]
+    fn panel_area_rounds_outward_to_cover_fractional_pixel_bounds() {
+        let primitive =
+            mesh_primitive([[1.2, 2.1], [2.6, 2.1], [1.2, 3.7]], egui::Rect::EVERYTHING);
+
+        let area = panel_area_from_primitives(&[primitive], 1.5, extent(50, 50)).unwrap();
+
+        assert_eq!((area.x, area.y, area.width, area.height), (1, 3, 3, 3));
+    }
+
+    #[test]
+    fn panel_area_clamps_to_swapchain_extent() {
+        let primitive = mesh_primitive(
+            [[-10.0, -5.0], [900.0, -5.0], [-10.0, 700.0]],
+            egui::Rect::EVERYTHING,
+        );
+
+        let area = panel_area_from_primitives(&[primitive], 1.0, extent(40, 30)).unwrap();
+
+        assert_eq!((area.x, area.y, area.width, area.height), (0, 0, 40, 30));
+    }
+
+    #[test]
+    fn panel_area_returns_none_for_empty_or_invisible_meshes() {
+        let empty = egui::ClippedPrimitive {
+            clip_rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0)),
+            primitive: egui::epaint::Primitive::Mesh(egui::epaint::Mesh::default()),
+        };
+        let invisible = mesh_primitive(
+            [[20.0, 20.0], [30.0, 20.0], [20.0, 30.0]],
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0)),
+        );
+
+        assert!(panel_area_from_primitives(&[], 1.0, extent(100, 100)).is_none());
+        assert!(panel_area_from_primitives(&[empty], 1.0, extent(100, 100)).is_none());
+        assert!(panel_area_from_primitives(&[invisible], 1.0, extent(100, 100)).is_none());
+    }
+
+    #[test]
+    fn malformed_index_meshes_are_ignored() {
+        let mut malformed = mesh_primitive(
+            [[1.0, 1.0], [10.0, 1.0], [1.0, 10.0]],
+            egui::Rect::EVERYTHING,
+        );
+        let egui::epaint::Primitive::Mesh(mesh) = &mut malformed.primitive else {
+            unreachable!();
+        };
+        mesh.indices.push(99);
+
+        assert!(panel_area_from_primitives(&[malformed.clone()], 1.0, extent(100, 100)).is_none());
+        assert!(localize_primitives(
+            &[malformed],
+            PanelArea {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 20
+            },
+            1.0
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn local_primitives_shift_vertices_and_clip_rects_into_panel_space() {
+        let primitive = mesh_primitive(
+            [[7.5, 6.0], [10.0, 6.0], [7.5, 8.0]],
+            egui::Rect::from_min_max(egui::pos2(5.0, 4.0), egui::pos2(10.0, 8.0)),
+        );
+        let area = super::PanelArea {
+            x: 5,
+            y: 4,
+            width: 7,
+            height: 5,
+        };
+
+        let localized = localize_primitives(&[primitive], area, 2.0);
+        let egui::epaint::Primitive::Mesh(mesh) = &localized[0].primitive else {
+            panic!("expected localized mesh");
+        };
+
+        assert_eq!(mesh.vertices[0].pos, egui::pos2(5.0, 4.0));
+        assert_eq!(localized[0].clip_rect.min, egui::pos2(2.5, 2.0));
+        assert_eq!(localized[0].clip_rect.max, egui::pos2(3.5, 2.5));
+    }
 
     #[test]
     fn failed_overlay_submission_initializes_each_present_result() {
