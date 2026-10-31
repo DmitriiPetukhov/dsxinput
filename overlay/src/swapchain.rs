@@ -1,6 +1,9 @@
 //! Swapchain eligibility, acquisition state, and Vulkan extension forwarding.
 
-use crate::dispatch;
+use crate::{
+    dispatch,
+    hdr::{classify_output_color_mode, OutputColorMode},
+};
 use ash::vk::{self, Handle};
 use std::{
     collections::{HashMap, HashSet},
@@ -308,8 +311,11 @@ unsafe fn evaluate_eligibility(
     if create_info.image_array_layers != 1 {
         return disabled("swapchain has more than one image layer");
     }
-    if !is_sdr_color_space(create_info.image_color_space) {
-        return disabled("swapchain color space is unsupported or HDR");
+    if !matches!(
+        classify_output_color_mode(create_info.image_format, create_info.image_color_space),
+        Some(OutputColorMode::Sdr)
+    ) {
+        return disabled("swapchain color space and format are unsupported or HDR");
     }
     if create_info
         .flags
@@ -353,21 +359,6 @@ unsafe fn evaluate_eligibility(
         present_families,
         disable_reason: None,
     }
-}
-
-fn is_sdr_color_space(color_space: vk::ColorSpaceKHR) -> bool {
-    matches!(
-        color_space,
-        vk::ColorSpaceKHR::SRGB_NONLINEAR
-            | vk::ColorSpaceKHR::DISPLAY_P3_NONLINEAR_EXT
-            | vk::ColorSpaceKHR::DISPLAY_P3_LINEAR_EXT
-            | vk::ColorSpaceKHR::DCI_P3_NONLINEAR_EXT
-            | vk::ColorSpaceKHR::BT709_LINEAR_EXT
-            | vk::ColorSpaceKHR::BT709_NONLINEAR_EXT
-            | vk::ColorSpaceKHR::BT2020_LINEAR_EXT
-            | vk::ColorSpaceKHR::ADOBERGB_LINEAR_EXT
-            | vk::ColorSpaceKHR::ADOBERGB_NONLINEAR_EXT
-    )
 }
 
 fn disabled(reason: &'static str) -> Eligibility {

@@ -3,6 +3,7 @@
 //! Vulkan layer implementation for the dsxinput in-game version overlay.
 
 mod dispatch;
+mod hdr;
 mod overlay_render;
 mod render_sync;
 mod swapchain;
