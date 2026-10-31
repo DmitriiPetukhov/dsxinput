@@ -5,11 +5,11 @@ use std::{
     thread::JoinHandle,
 };
 
-use evdev::{EventType, SynchronizationCode};
+use evdev::{AbsoluteAxisCode, EventType, InputEvent, SynchronizationCode};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::{
-    physical_gamepad::{self, PhysicalGamepad},
+    physical_gamepad::PhysicalGamepad, stick_axis_filter::StickAxisFilter,
     virtual_gamepad::VirtualGamepad,
 };
 
@@ -73,6 +73,12 @@ impl GamepadSession {
         shutdown_receiver: UnixStream,
     ) -> io::Result<()> {
         let mut events_frame = Vec::new();
+        let mut stick_filters = [
+            (AbsoluteAxisCode::ABS_X, StickAxisFilter::new(0.1)),
+            (AbsoluteAxisCode::ABS_Y, StickAxisFilter::new(0.1)),
+            (AbsoluteAxisCode::ABS_RX, StickAxisFilter::new(0.1)),
+            (AbsoluteAxisCode::ABS_RY, StickAxisFilter::new(0.1)),
+        ];
 
         loop {
             let (shutdown_events, input_events) = {
@@ -110,9 +116,7 @@ impl GamepadSession {
             if input_events.contains(PollFlags::POLLIN) {
                 match physical_gamepad.read_events() {
                     Ok(events) => {
-                        for event in events {
-                            // println!("[{}] {event:?}", physical_gamepad.name());
-
+                        for mut event in events {
                             let is_report = event.event_type() == EventType::SYNCHRONIZATION
                                 && event.code() == SynchronizationCode::SYN_REPORT.0;
 
@@ -122,6 +126,23 @@ impl GamepadSession {
                                     events_frame.clear();
                                 }
                             } else {
+                                if event.event_type() == EventType::ABSOLUTE {
+                                    if let Some((_, filter)) = stick_filters
+                                        .iter_mut()
+                                        .find(|(axis, _)| axis.0 == event.code())
+                                    {
+                                        let Some(value) = filter.apply(event.value()) else {
+                                            continue;
+                                        };
+                                        if value != event.value() {
+                                            event = InputEvent::new(
+                                                event.event_type().0,
+                                                event.code(),
+                                                value,
+                                            );
+                                        }
+                                    }
+                                }
                                 events_frame.push(event);
                             }
                         }
