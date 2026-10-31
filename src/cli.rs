@@ -5,6 +5,7 @@ use std::{ffi::OsString, path::PathBuf};
 pub(crate) struct Options {
     pub(crate) device: Option<PathBuf>,
     pub(crate) diagnostic: bool,
+    pub(crate) debug: bool,
     pub(crate) command: Vec<OsString>,
 }
 
@@ -20,6 +21,7 @@ impl Options {
                     options.device = args.next().map(PathBuf::from);
                 }
                 Some("--diagnose") => options.diagnostic = true,
+                Some("--debug") => options.debug = true,
                 Some("--") => {
                     options.command.extend(args);
                     break;
@@ -56,6 +58,7 @@ mod tests {
             Options {
                 device: Some(PathBuf::from("/dev/input/event7")),
                 diagnostic: true,
+                debug: false,
                 command: vec!["game".into(), "--flag".into()],
             }
         );
@@ -138,6 +141,32 @@ mod tests {
         let options = parse(&["--diagnose", "--diagnose"]);
         assert!(options.diagnostic);
         assert!(options.command.is_empty());
+    }
+
+    #[test]
+    fn debug_before_command_is_removed_and_idempotent() {
+        let options = parse(&["--debug", "--debug", "vkcube", "--debug"]);
+        assert_eq!(options.command, ["vkcube", "--debug"]);
+        assert!(options.debug);
+    }
+
+    #[test]
+    fn debug_after_command_or_separator_is_passed_to_child() {
+        let after_command = parse(&["vkcube", "--debug"]);
+        assert_eq!(after_command.command, ["vkcube", "--debug"]);
+        assert!(!after_command.debug);
+
+        let after_separator = parse(&["--", "--debug"]);
+        assert_eq!(after_separator.command, ["--debug"]);
+        assert!(!after_separator.debug);
+    }
+
+    #[test]
+    fn debug_can_combine_with_diagnose_without_a_command() {
+        let options = parse(&["--debug", "--diagnose"]);
+        assert!(options.diagnostic);
+        assert!(options.command.is_empty());
+        assert!(options.debug);
     }
 
     #[test]

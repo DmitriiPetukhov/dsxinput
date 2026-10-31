@@ -30,7 +30,10 @@ extern "C" fn handle_signal(_: libc::c_int) {
 pub(crate) fn run() -> io::Result<i32> {
     let options = cli::Options::parse(env::args_os().skip(1));
     if options.command.is_empty() && !options.diagnostic {
-        eprintln!("dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--diagnose] COMMAND [ARGS...]\n       dsxinput --diagnose", env!("CARGO_PKG_VERSION"));
+        eprintln!(
+            "dsxinput v{}\nUsage: dsxinput [--device /dev/input/eventN] [--debug] [--diagnose] COMMAND [ARGS...]\n       dsxinput [--device /dev/input/eventN] --diagnose [--debug]",
+            env!("CARGO_PKG_VERSION")
+        );
         return Ok(2);
     }
     unsafe {
