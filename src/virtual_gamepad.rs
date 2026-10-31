@@ -102,15 +102,16 @@ pub struct VirtualGamepad {
 }
 
 impl VirtualGamepad {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(name: &str) -> io::Result<Self> {
         let definition = &GAMEPAD_DEFINITION;
         let mut buttons = AttributeSet::<KeyCode>::new();
         for &button in definition.buttons {
             buttons.insert(button);
         }
 
+        let device_name = format!("{} {}", definition.name, name);
         let mut builder = VirtualDevice::builder()?
-            .name(definition.name)
+            .name(&device_name)
             .input_id(InputId::new(
                 definition.bus,
                 definition.vendor,

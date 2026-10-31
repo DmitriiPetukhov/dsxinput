@@ -9,7 +9,7 @@ pub struct VirtualGamepadManager<G, F> {
     create_gamepad: F,
 }
 
-impl<G, F: FnMut() -> io::Result<G>> VirtualGamepadManager<G, F> {
+impl<G, F: FnMut(&str) -> io::Result<G>> VirtualGamepadManager<G, F> {
     pub fn new(create_gamepad: F) -> Self {
         Self {
             gamepads: HashMap::new(),
@@ -18,7 +18,7 @@ impl<G, F: FnMut() -> io::Result<G>> VirtualGamepadManager<G, F> {
     }
     pub fn create(&mut self, path: &CStr) -> io::Result<()> {
         if let Entry::Vacant(entry) = self.gamepads.entry(path.to_owned()) {
-            let gamepad = (self.create_gamepad)()?;
+            let gamepad = (self.create_gamepad)(&path.to_string_lossy())?;
             entry.insert(gamepad);
         }
 
@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn starts_empty_without_creating_devices() {
-        let manager = VirtualGamepadManager::new(|| -> io::Result<()> {
+        let manager = VirtualGamepadManager::new(|_: &str| -> io::Result<()> {
             panic!("factory should not run during initialization")
         });
         assert!(manager.gamepads.is_empty());
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn creates_once_per_distinct_path() {
         let creations = Cell::new(0);
-        let mut manager = VirtualGamepadManager::new(|| {
+        let mut manager = VirtualGamepadManager::new(|_: &str| {
             creations.set(creations.get() + 1);
             Ok(creations.get())
         });
@@ -75,9 +75,19 @@ mod tests {
     }
 
     #[test]
+    fn passes_each_device_path_to_the_factory_as_its_name() {
+        let mut manager = VirtualGamepadManager::new(|name: &str| Ok(name.to_owned()));
+        manager.create(&path("/dev/hidraw1")).unwrap();
+        manager.create(&path("/dev/hidraw2")).unwrap();
+
+        assert_eq!(manager.gamepads[&path("/dev/hidraw1")], "/dev/hidraw1");
+        assert_eq!(manager.gamepads[&path("/dev/hidraw2")], "/dev/hidraw2");
+    }
+
+    #[test]
     fn failed_creation_preserves_existing_devices_and_allows_retry() {
         let attempts = Cell::new(0);
-        let mut manager = VirtualGamepadManager::new(|| {
+        let mut manager = VirtualGamepadManager::new(|_: &str| {
             attempts.set(attempts.get() + 1);
             if attempts.get() == 2 {
                 Err(io::Error::new(
@@ -104,7 +114,7 @@ mod tests {
     #[test]
     fn removal_drops_only_the_requested_device_once() {
         let drops = Rc::new(Cell::new(0));
-        let mut manager = VirtualGamepadManager::new(|| {
+        let mut manager = VirtualGamepadManager::new(|_: &str| {
             Ok(FakeGamepad {
                 drops: Rc::clone(&drops),
             })
@@ -128,7 +138,7 @@ mod tests {
     #[test]
     fn reconnect_creates_a_fresh_device() {
         let creations = Cell::new(0);
-        let mut manager = VirtualGamepadManager::new(|| {
+        let mut manager = VirtualGamepadManager::new(|_: &str| {
             creations.set(creations.get() + 1);
             Ok(creations.get())
         });
@@ -145,7 +155,7 @@ mod tests {
     fn dropping_manager_drops_all_remaining_devices() {
         let drops = Rc::new(Cell::new(0));
         {
-            let mut manager = VirtualGamepadManager::new(|| {
+            let mut manager = VirtualGamepadManager::new(|_: &str| {
                 Ok(FakeGamepad {
                     drops: Rc::clone(&drops),
                 })
