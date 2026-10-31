@@ -3,3 +3,4 @@
 //! Vulkan layer implementation for the dsxinput in-game version overlay.
 
 mod dispatch;
+mod swapchain;

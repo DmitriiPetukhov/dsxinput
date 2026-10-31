@@ -92,6 +92,17 @@ type DeviceDispatch = HashMap<vk::Device, vk::PFN_vkGetDeviceProcAddr>;
 type DeviceStates = HashMap<vk::Device, DeviceState>;
 type QueueDispatch = HashMap<vk::Queue, QueueState>;
 
+pub(crate) struct SurfaceQueueFamily {
+    pub(crate) requested_count: u32,
+    pub(crate) properties: vk::QueueFamilyProperties,
+}
+
+pub(crate) struct DeviceSurfaceContext {
+    pub(crate) instance: vk::Instance,
+    pub(crate) physical_device: vk::PhysicalDevice,
+    pub(crate) queue_families: HashMap<u32, SurfaceQueueFamily>,
+}
+
 #[derive(Clone)]
 struct DeviceState {
     instance: vk::Instance,
@@ -106,14 +117,14 @@ struct QueueFamilyState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct QueueMetadata {
-    device: vk::Device,
-    instance: vk::Instance,
-    physical_device: vk::PhysicalDevice,
-    family_index: u32,
-    queue_index: u32,
-    flags: vk::DeviceQueueCreateFlags,
-    family_flags: vk::QueueFlags,
+pub(crate) struct QueueMetadata {
+    pub(crate) device: vk::Device,
+    pub(crate) instance: vk::Instance,
+    pub(crate) physical_device: vk::PhysicalDevice,
+    pub(crate) family_index: u32,
+    pub(crate) queue_index: u32,
+    pub(crate) flags: vk::DeviceQueueCreateFlags,
+    pub(crate) family_flags: vk::QueueFlags,
 }
 
 impl QueueMetadata {
@@ -471,6 +482,10 @@ unsafe fn dispatch_instance_proc(
         return None;
     }
     let name = unsafe { CStr::from_ptr(name) };
+    let swapchain_function = unsafe { crate::swapchain::instance_proc(instance, name, next) };
+    if swapchain_function.is_some() {
+        return swapchain_function;
+    }
     if name.to_bytes() == b"vkGetInstanceProcAddr" {
         return erase_function(vkGetInstanceProcAddr as vk::PFN_vkGetInstanceProcAddr);
     }
@@ -538,6 +553,10 @@ unsafe fn dispatch_device_proc(
         return None;
     }
     let name = unsafe { CStr::from_ptr(name) };
+    let swapchain_function = unsafe { crate::swapchain::device_proc(device, name, next) };
+    if swapchain_function.is_some() {
+        return swapchain_function;
+    }
     if name.to_bytes() == b"vkGetDeviceProcAddr" {
         return erase_function(vkGetDeviceProcAddr as vk::PFN_vkGetDeviceProcAddr);
     }
@@ -678,11 +697,14 @@ unsafe fn destroy_instance(instance: vk::Instance, allocator: *const vk::Allocat
             unsafe { destroy(instance, allocator) };
         }
     }
+    crate::swapchain::remove_instance(instance);
     instance_dispatch().remove(&instance);
     physical_device_instances().retain(|_, physical_instance| *physical_instance != instance);
 }
 
-fn next_instance_proc_addr(instance: vk::Instance) -> Option<vk::PFN_vkGetInstanceProcAddr> {
+pub(crate) fn next_instance_proc_addr(
+    instance: vk::Instance,
+) -> Option<vk::PFN_vkGetInstanceProcAddr> {
     let dispatch = instance_dispatch();
     dispatch.get(&instance).copied().or_else(|| {
         if instance.is_null() {
@@ -697,18 +719,42 @@ fn next_device_proc_addr(device: vk::Device) -> Option<vk::PFN_vkGetDeviceProcAd
     device_dispatch().get(&device).copied()
 }
 
-unsafe fn next_device_function(device: vk::Device, name: &CStr) -> vk::PFN_vkVoidFunction {
+pub(crate) unsafe fn next_device_function(
+    device: vk::Device,
+    name: &CStr,
+) -> vk::PFN_vkVoidFunction {
     let Some(next) = next_device_proc_addr(device) else {
         return None;
     };
     unsafe { next(device, name.as_ptr()) }
 }
 
-fn queue_metadata(queue: vk::Queue) -> Option<QueueMetadata> {
+pub(crate) fn queue_metadata(queue: vk::Queue) -> Option<QueueMetadata> {
     queue_dispatch().get(&queue).map(|state| state.metadata)
 }
 
-fn with_queue_serialization<T>(queue: vk::Queue, call: impl FnOnce() -> T) -> T {
+pub(crate) fn device_surface_context(device: vk::Device) -> Option<DeviceSurfaceContext> {
+    let state = device_states().get(&device).cloned()?;
+    Some(DeviceSurfaceContext {
+        instance: state.instance,
+        physical_device: state.physical_device,
+        queue_families: state
+            .queue_families
+            .into_iter()
+            .map(|(index, family)| {
+                (
+                    index,
+                    SurfaceQueueFamily {
+                        requested_count: family.requested_count,
+                        properties: family.properties,
+                    },
+                )
+            })
+            .collect(),
+    })
+}
+
+pub(crate) fn with_queue_serialization<T>(queue: vk::Queue, call: impl FnOnce() -> T) -> T {
     let serialization = queue_dispatch()
         .get(&queue)
         .map(|state| Arc::clone(&state.serialization));
@@ -1096,6 +1142,7 @@ unsafe fn destroy_device(device: vk::Device, allocator: *const vk::AllocationCal
             unsafe { destroy(device, allocator) };
         }
     }
+    crate::swapchain::remove_device(device);
     device_dispatch().remove(&device);
     device_states().remove(&device);
     queue_dispatch().retain(|_, state| state.metadata.device != device);
@@ -1150,6 +1197,7 @@ unsafe fn enumerate_layer_extensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::swapchain;
     use ash::vk::Handle;
     use std::{
         ffi::{c_char, CStr},
@@ -1163,7 +1211,28 @@ mod tests {
     static MAX_CONCURRENT_QUEUE_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
     static QUEUE_SUBMIT2_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DESTROYED_DEVICES: AtomicUsize = AtomicUsize::new(0);
-    static DISPATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static DISPATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static SWAPCHAIN_CREATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SWAPCHAIN_CREATE_USAGES: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    static SWAPCHAIN_CREATE_LAST_USAGE: AtomicUsize = AtomicUsize::new(0);
+    static SWAPCHAIN_CREATE_PNEXT: AtomicUsize = AtomicUsize::new(0);
+    static SWAPCHAIN_FAIL_ADDED_USAGE: AtomicUsize = AtomicUsize::new(0);
+    static SWAPCHAIN_DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SWAPCHAIN_IMAGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static ACQUIRE_RESULT: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(vk::Result::SUCCESS.as_raw());
+    static ACQUIRE2_RESULT: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(vk::Result::SUCCESS.as_raw());
+    static ACQUIRE2_PNEXT: AtomicUsize = AtomicUsize::new(0);
+    static PRESENT_RESULT: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(vk::Result::SUCCESS.as_raw());
+    static PRESENT_FIRST_RESULT: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(vk::Result::SUCCESS.as_raw());
+    static PRESENT_SECOND_RESULT: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(vk::Result::SUBOPTIMAL_KHR.as_raw());
+    static PRESENT_PNEXT: AtomicUsize = AtomicUsize::new(0);
+    static PRESENT_RESULTS: AtomicUsize = AtomicUsize::new(0);
+    static SURFACE_COLOR_ATTACHMENT_SUPPORTED: AtomicUsize = AtomicUsize::new(1);
 
     unsafe extern "system" fn next_gipa(
         _instance: vk::Instance,
@@ -1365,6 +1434,218 @@ mod tests {
         Some(next_unknown_proc)
     }
 
+    unsafe extern "system" fn next_gdpa_with_swapchain(
+        device: vk::Device,
+        name: *const c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        if !name.is_null() {
+            match unsafe { CStr::from_ptr(name) }.to_bytes() {
+                b"vkCreateSwapchainKHR" => {
+                    return erase_function(next_create_swapchain as vk::PFN_vkCreateSwapchainKHR)
+                }
+                b"vkDestroySwapchainKHR" => {
+                    return erase_function(next_destroy_swapchain as vk::PFN_vkDestroySwapchainKHR)
+                }
+                b"vkGetSwapchainImagesKHR" => {
+                    return erase_function(
+                        next_get_swapchain_images as vk::PFN_vkGetSwapchainImagesKHR,
+                    )
+                }
+                b"vkAcquireNextImageKHR" => {
+                    return erase_function(next_acquire_next_image as vk::PFN_vkAcquireNextImageKHR)
+                }
+                b"vkAcquireNextImage2KHR" => {
+                    return erase_function(
+                        next_acquire_next_image2 as vk::PFN_vkAcquireNextImage2KHR,
+                    )
+                }
+                b"vkQueuePresentKHR" => {
+                    return erase_function(next_queue_present as vk::PFN_vkQueuePresentKHR)
+                }
+                _ => {}
+            }
+        }
+        unsafe { next_gdpa(device, name) }
+    }
+
+    unsafe extern "system" fn next_gipa_with_surface(
+        instance: vk::Instance,
+        name: *const c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        if !name.is_null() {
+            match unsafe { CStr::from_ptr(name) }.to_bytes() {
+                b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" => {
+                    return erase_function(
+                        next_surface_capabilities
+                            as vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
+                    )
+                }
+                b"vkGetPhysicalDeviceSurfaceSupportKHR" => {
+                    return erase_function(
+                        next_surface_support as vk::PFN_vkGetPhysicalDeviceSurfaceSupportKHR,
+                    )
+                }
+                _ => {}
+            }
+        }
+        unsafe { next_gipa(instance, name) }
+    }
+
+    unsafe extern "system" fn next_create_swapchain(
+        _device: vk::Device,
+        create_info: *const vk::SwapchainCreateInfoKHR<'_>,
+        _allocator: *const vk::AllocationCallbacks<'_>,
+        swapchain: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        let call = SWAPCHAIN_CREATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        if !create_info.is_null() {
+            let create_info = unsafe { &*create_info };
+            let slot = call.min(1);
+            SWAPCHAIN_CREATE_USAGES[slot]
+                .store(create_info.image_usage.as_raw() as usize, Ordering::SeqCst);
+            SWAPCHAIN_CREATE_LAST_USAGE
+                .store(create_info.image_usage.as_raw() as usize, Ordering::SeqCst);
+            SWAPCHAIN_CREATE_PNEXT.store(create_info.p_next as usize, Ordering::SeqCst);
+            if SWAPCHAIN_FAIL_ADDED_USAGE.load(Ordering::SeqCst) != 0
+                && create_info
+                    .image_usage
+                    .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            {
+                return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
+            }
+        }
+        if !swapchain.is_null() {
+            unsafe { *swapchain = vk::SwapchainKHR::from_raw(0xC100 + call as u64) };
+        }
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn next_destroy_swapchain(
+        _device: vk::Device,
+        _swapchain: vk::SwapchainKHR,
+        _allocator: *const vk::AllocationCallbacks<'_>,
+    ) {
+        SWAPCHAIN_DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "system" fn next_get_swapchain_images(
+        _device: vk::Device,
+        _swapchain: vk::SwapchainKHR,
+        image_count: *mut u32,
+        images: *mut vk::Image,
+    ) -> vk::Result {
+        SWAPCHAIN_IMAGE_CALLS.fetch_add(1, Ordering::SeqCst);
+        if image_count.is_null() {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        if images.is_null() {
+            unsafe { *image_count = 2 };
+            return vk::Result::SUCCESS;
+        }
+        let count = unsafe { (*image_count).min(2) };
+        for index in 0..count {
+            unsafe { *images.add(index as usize) = vk::Image::from_raw(0xD100 + u64::from(index)) };
+        }
+        unsafe { *image_count = count };
+        if count < 2 {
+            vk::Result::INCOMPLETE
+        } else {
+            vk::Result::SUCCESS
+        }
+    }
+
+    unsafe extern "system" fn next_acquire_next_image(
+        _device: vk::Device,
+        _swapchain: vk::SwapchainKHR,
+        _timeout: u64,
+        _semaphore: vk::Semaphore,
+        _fence: vk::Fence,
+        image_index: *mut u32,
+    ) -> vk::Result {
+        if !image_index.is_null() {
+            unsafe { *image_index = 1 };
+        }
+        vk::Result::from_raw(ACQUIRE_RESULT.load(Ordering::SeqCst))
+    }
+
+    unsafe extern "system" fn next_acquire_next_image2(
+        _device: vk::Device,
+        acquire_info: *const vk::AcquireNextImageInfoKHR<'_>,
+        image_index: *mut u32,
+    ) -> vk::Result {
+        if !acquire_info.is_null() {
+            ACQUIRE2_PNEXT.store(unsafe { (*acquire_info).p_next } as usize, Ordering::SeqCst);
+        }
+        if !image_index.is_null() {
+            unsafe { *image_index = 0 };
+        }
+        vk::Result::from_raw(ACQUIRE2_RESULT.load(Ordering::SeqCst))
+    }
+
+    unsafe extern "system" fn next_queue_present(
+        _queue: vk::Queue,
+        present_info: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        if present_info.is_null() {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        let info = unsafe { &*present_info };
+        PRESENT_PNEXT.store(info.p_next as usize, Ordering::SeqCst);
+        PRESENT_RESULTS.store(info.p_results as usize, Ordering::SeqCst);
+        if !info.p_results.is_null() {
+            for index in 0..info.swapchain_count as usize {
+                unsafe {
+                    *info.p_results.add(index) = if index == 0 {
+                        vk::Result::from_raw(PRESENT_FIRST_RESULT.load(Ordering::SeqCst))
+                    } else {
+                        vk::Result::from_raw(PRESENT_SECOND_RESULT.load(Ordering::SeqCst))
+                    }
+                };
+            }
+        }
+        vk::Result::from_raw(PRESENT_RESULT.load(Ordering::SeqCst))
+    }
+
+    unsafe extern "system" fn next_surface_capabilities(
+        _physical_device: vk::PhysicalDevice,
+        _surface: vk::SurfaceKHR,
+        capabilities: *mut vk::SurfaceCapabilitiesKHR,
+    ) -> vk::Result {
+        if capabilities.is_null() {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        unsafe {
+            *capabilities = vk::SurfaceCapabilitiesKHR::default().supported_usage_flags(
+                vk::ImageUsageFlags::TRANSFER_SRC
+                    | if SURFACE_COLOR_ATTACHMENT_SUPPORTED.load(Ordering::SeqCst) != 0 {
+                        vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    } else {
+                        vk::ImageUsageFlags::empty()
+                    },
+            )
+        };
+        vk::Result::SUCCESS
+    }
+
+    unsafe extern "system" fn next_surface_support(
+        _physical_device: vk::PhysicalDevice,
+        queue_family_index: u32,
+        _surface: vk::SurfaceKHR,
+        supported: *mut vk::Bool32,
+    ) -> vk::Result {
+        if supported.is_null() {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        unsafe {
+            *supported = if queue_family_index == 1 {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            }
+        };
+        vk::Result::SUCCESS
+    }
+
     unsafe extern "system" fn gdpa_without_get_device_queue2(
         device: vk::Device,
         name: *const c_char,
@@ -1450,6 +1731,534 @@ mod tests {
         _allocator: *const vk::AllocationCallbacks<'_>,
     ) {
         DESTROYED_DEVICES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn setup_swapchain_device() -> (vk::Device, vk::Queue, vk::SurfaceKHR) {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        swapchain::clear();
+        let id = NEXT_FIXTURE.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+        let device = vk::Device::from_raw(0xE000 + id);
+        let instance = vk::Instance::from_raw(0xE100 + id);
+        let physical_device = vk::PhysicalDevice::from_raw(0xE200 + id);
+        let queue = vk::Queue::from_raw(0xE300 + id);
+        let surface = vk::SurfaceKHR::from_raw(0xE400 + id);
+        let properties = vk::QueueFamilyProperties::default()
+            .queue_flags(vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER)
+            .queue_count(1);
+
+        instance_dispatch().insert(instance, next_gipa_with_surface);
+        device_dispatch().insert(device, next_gdpa_with_swapchain);
+        device_states().insert(
+            device,
+            DeviceState {
+                instance,
+                physical_device,
+                queue_families: HashMap::from([(
+                    1,
+                    QueueFamilyState {
+                        requested_count: 1,
+                        properties,
+                    },
+                )]),
+            },
+        );
+        queue_dispatch().insert(
+            queue,
+            QueueState::new(QueueMetadata {
+                device,
+                instance,
+                physical_device,
+                family_index: 1,
+                queue_index: 0,
+                flags: vk::DeviceQueueCreateFlags::empty(),
+                family_flags: properties.queue_flags,
+            }),
+        );
+        SWAPCHAIN_CREATE_CALLS.store(0, Ordering::SeqCst);
+        SWAPCHAIN_CREATE_USAGES[0].store(0, Ordering::SeqCst);
+        SWAPCHAIN_CREATE_USAGES[1].store(0, Ordering::SeqCst);
+        SWAPCHAIN_CREATE_LAST_USAGE.store(0, Ordering::SeqCst);
+        SWAPCHAIN_CREATE_PNEXT.store(0, Ordering::SeqCst);
+        SWAPCHAIN_FAIL_ADDED_USAGE.store(0, Ordering::SeqCst);
+        SWAPCHAIN_DESTROY_CALLS.store(0, Ordering::SeqCst);
+        SWAPCHAIN_IMAGE_CALLS.store(0, Ordering::SeqCst);
+        ACQUIRE_RESULT.store(vk::Result::SUCCESS.as_raw(), Ordering::SeqCst);
+        ACQUIRE2_RESULT.store(vk::Result::SUCCESS.as_raw(), Ordering::SeqCst);
+        ACQUIRE2_PNEXT.store(0, Ordering::SeqCst);
+        PRESENT_RESULT.store(vk::Result::SUCCESS.as_raw(), Ordering::SeqCst);
+        PRESENT_FIRST_RESULT.store(vk::Result::SUCCESS.as_raw(), Ordering::SeqCst);
+        PRESENT_SECOND_RESULT.store(vk::Result::SUBOPTIMAL_KHR.as_raw(), Ordering::SeqCst);
+        PRESENT_PNEXT.store(0, Ordering::SeqCst);
+        PRESENT_RESULTS.store(0, Ordering::SeqCst);
+        SURFACE_COLOR_ATTACHMENT_SUPPORTED.store(1, Ordering::SeqCst);
+        (device, queue, surface)
+    }
+
+    fn cleanup_swapchain_device(device: vk::Device, queue: vk::Queue, _instance: vk::Instance) {
+        let instance = device_states().get(&device).map(|state| state.instance);
+        swapchain::clear();
+        queue_dispatch().remove(&queue);
+        device_states().remove(&device);
+        device_dispatch().remove(&device);
+        if let Some(instance) = instance {
+            instance_dispatch().remove(&instance);
+        }
+    }
+
+    fn base_swapchain_create_info(surface: vk::SurfaceKHR) -> vk::SwapchainCreateInfoKHR<'static> {
+        let mut info = vk::SwapchainCreateInfoKHR::default();
+        info.surface = surface;
+        info.min_image_count = 2;
+        info.image_format = vk::Format::B8G8R8A8_UNORM;
+        info.image_color_space = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+        info.image_extent = vk::Extent2D {
+            width: 640,
+            height: 480,
+        };
+        info.image_array_layers = 1;
+        info.image_usage = vk::ImageUsageFlags::TRANSFER_DST;
+        info.image_sharing_mode = vk::SharingMode::EXCLUSIVE;
+        info.present_mode = vk::PresentModeKHR::FIFO;
+        info
+    }
+
+    unsafe fn call_create_swapchain(
+        device: vk::Device,
+        info: *const vk::SwapchainCreateInfoKHR<'_>,
+    ) -> (vk::Result, vk::SwapchainKHR) {
+        let function = unsafe { vkGetDeviceProcAddr(device, c"vkCreateSwapchainKHR".as_ptr()) }
+            .expect("swapchain creation proc");
+        let create: vk::PFN_vkCreateSwapchainKHR = unsafe { std::mem::transmute_copy(&function) };
+        let mut swapchain = vk::SwapchainKHR::null();
+        let result = unsafe { create(device, info, std::ptr::null(), &mut swapchain) };
+        (result, swapchain)
+    }
+
+    #[test]
+    fn swapchain_device_commands_are_intercepted_when_downstream_supports_them() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, _) = setup_swapchain_device();
+        for name in [
+            c"vkCreateSwapchainKHR",
+            c"vkDestroySwapchainKHR",
+            c"vkGetSwapchainImagesKHR",
+            c"vkAcquireNextImageKHR",
+            c"vkAcquireNextImage2KHR",
+            c"vkQueuePresentKHR",
+        ] {
+            let layer = unsafe { vkGetDeviceProcAddr(device, name.as_ptr()) }
+                .expect("downstream-supported swapchain command");
+            let downstream = unsafe { next_gdpa_with_swapchain(device, name.as_ptr()) }
+                .expect("fixture swapchain command");
+            assert_ne!(
+                layer as usize,
+                downstream as usize,
+                "{}",
+                name.to_string_lossy()
+            );
+        }
+        let instance = device_states().get(&device).unwrap().instance;
+        for name in [
+            c"vkCreateSwapchainKHR",
+            c"vkDestroySwapchainKHR",
+            c"vkGetSwapchainImagesKHR",
+            c"vkAcquireNextImageKHR",
+            c"vkAcquireNextImage2KHR",
+            c"vkQueuePresentKHR",
+        ] {
+            let layer = unsafe { vkGetInstanceProcAddr(instance, name.as_ptr()) }
+                .expect("instance-supported swapchain command");
+            let downstream = unsafe { next_gipa_with_surface(instance, name.as_ptr()) }
+                .expect("fixture instance command");
+            assert_ne!(
+                layer as usize,
+                downstream as usize,
+                "{}",
+                name.to_string_lossy()
+            );
+        }
+        cleanup_swapchain_device(device, queue, vk::Instance::from_raw(0xE101));
+    }
+
+    unsafe extern "system" fn gdpa_without_swapchain_create(
+        device: vk::Device,
+        name: *const c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        if !name.is_null() && unsafe { CStr::from_ptr(name) }.to_bytes() == b"vkCreateSwapchainKHR"
+        {
+            return None;
+        }
+        unsafe { next_gdpa_with_swapchain(device, name) }
+    }
+
+    #[test]
+    fn swapchain_commands_stay_unavailable_when_downstream_does_not_expose_them() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, _) = setup_swapchain_device();
+        device_dispatch().insert(device, gdpa_without_swapchain_create);
+
+        assert!(unsafe { vkGetDeviceProcAddr(device, c"vkCreateSwapchainKHR".as_ptr()) }.is_none());
+
+        cleanup_swapchain_device(device, queue, vk::Instance::from_raw(0));
+    }
+
+    #[test]
+    fn swapchain_creation_retries_without_added_usage_and_disables_overlay() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        SWAPCHAIN_FAIL_ADDED_USAGE.store(1, Ordering::SeqCst);
+        let mut info = base_swapchain_create_info(surface);
+        let sentinel = 0x1234usize;
+        info.p_next = sentinel as *const c_void;
+
+        let (result, swapchain) = unsafe { call_create_swapchain(device, &info) };
+
+        assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(SWAPCHAIN_CREATE_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            SWAPCHAIN_CREATE_USAGES[0].load(Ordering::SeqCst) as u32,
+            (vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT).as_raw()
+        );
+        assert_eq!(
+            SWAPCHAIN_CREATE_USAGES[1].load(Ordering::SeqCst) as u32,
+            vk::ImageUsageFlags::TRANSFER_DST.as_raw()
+        );
+        assert_eq!(SWAPCHAIN_CREATE_PNEXT.load(Ordering::SeqCst), sentinel);
+        let state = swapchain::state(swapchain).expect("registered fallback swapchain");
+        assert!(!state.enabled);
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn swapchain_recreation_with_old_swapchain_skips_usage_retry() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        let info = base_swapchain_create_info(surface);
+        let (old_result, old_swapchain) = unsafe { call_create_swapchain(device, &info) };
+        assert_eq!(old_result, vk::Result::SUCCESS);
+
+        SWAPCHAIN_CREATE_CALLS.store(0, Ordering::SeqCst);
+        SWAPCHAIN_FAIL_ADDED_USAGE.store(1, Ordering::SeqCst);
+        let mut recreation = base_swapchain_create_info(surface);
+        recreation.old_swapchain = old_swapchain;
+        let original_usage = recreation.image_usage;
+        let (result, new_swapchain) = unsafe { call_create_swapchain(device, &recreation) };
+
+        assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(SWAPCHAIN_CREATE_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            SWAPCHAIN_CREATE_LAST_USAGE.load(Ordering::SeqCst) as u32,
+            original_usage.as_raw()
+        );
+        assert!(!swapchain::state(new_swapchain).unwrap().enabled);
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn unsupported_swapchain_modes_are_forwarded_and_disabled() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        let mut layered = base_swapchain_create_info(surface);
+        layered.image_array_layers = 2;
+        let mut hdr = base_swapchain_create_info(surface);
+        hdr.image_color_space = vk::ColorSpaceKHR::HDR10_ST2084_EXT;
+        let mut protected = base_swapchain_create_info(surface);
+        protected.flags = vk::SwapchainCreateFlagsKHR::PROTECTED;
+        let mut shared = base_swapchain_create_info(surface);
+        shared.present_mode = vk::PresentModeKHR::SHARED_DEMAND_REFRESH;
+
+        for info in [layered, hdr, protected, shared] {
+            let original_usage = info.image_usage;
+            let (result, swapchain) = unsafe { call_create_swapchain(device, &info) };
+            assert_eq!(result, vk::Result::SUCCESS);
+            assert_eq!(
+                SWAPCHAIN_CREATE_LAST_USAGE.load(Ordering::SeqCst) as u32,
+                original_usage.as_raw()
+            );
+            let state = swapchain::state(swapchain).expect("registered unsupported swapchain");
+            assert!(!state.enabled);
+        }
+        let mut display_p3 = base_swapchain_create_info(surface);
+        display_p3.image_color_space = vk::ColorSpaceKHR::DISPLAY_P3_NONLINEAR_EXT;
+        let (_, display_p3_swapchain) = unsafe { call_create_swapchain(device, &display_p3) };
+        assert!(swapchain::state(display_p3_swapchain).unwrap().enabled);
+
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn swapchain_without_color_attachment_support_is_forwarded_unchanged() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        SURFACE_COLOR_ATTACHMENT_SUPPORTED.store(0, Ordering::SeqCst);
+        let info = base_swapchain_create_info(surface);
+        let (result, swapchain) = unsafe { call_create_swapchain(device, &info) };
+
+        assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(SWAPCHAIN_CREATE_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            SWAPCHAIN_CREATE_LAST_USAGE.load(Ordering::SeqCst) as u32,
+            info.image_usage.as_raw()
+        );
+        let state = swapchain::state(swapchain).expect("registered unsupported swapchain");
+        assert!(!state.enabled);
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn concurrent_swapchain_requires_the_present_queue_family() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        let families = [0u32];
+        let mut info = base_swapchain_create_info(surface);
+        info.image_sharing_mode = vk::SharingMode::CONCURRENT;
+        info.queue_family_index_count = families.len() as u32;
+        info.p_queue_family_indices = families.as_ptr();
+        let (_, swapchain) = unsafe { call_create_swapchain(device, &info) };
+
+        let state = swapchain::state(swapchain).expect("registered concurrent swapchain");
+        assert!(!state.enabled);
+        assert!(!swapchain::is_eligible_for_queue(swapchain, queue));
+
+        let supported_families = [1u32];
+        let mut supported_info = base_swapchain_create_info(surface);
+        supported_info.image_sharing_mode = vk::SharingMode::CONCURRENT;
+        supported_info.queue_family_index_count = supported_families.len() as u32;
+        supported_info.p_queue_family_indices = supported_families.as_ptr();
+        let (_, supported_swapchain) = unsafe { call_create_swapchain(device, &supported_info) };
+        assert!(swapchain::state(supported_swapchain).unwrap().enabled);
+        assert!(swapchain::is_eligible_for_queue(supported_swapchain, queue));
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn acquire_apis_and_swapchain_images_preserve_driver_results_and_indices() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        let mut info = base_swapchain_create_info(surface);
+        info.image_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let (create_result, swapchain) = unsafe { call_create_swapchain(device, &info) };
+        assert_eq!(create_result, vk::Result::SUCCESS);
+        assert!(swapchain::state(swapchain).unwrap().enabled);
+        assert!(swapchain::is_eligible_for_queue(swapchain, queue));
+
+        let get_images =
+            unsafe { vkGetDeviceProcAddr(device, c"vkGetSwapchainImagesKHR".as_ptr()) }
+                .expect("image enumeration proc");
+        let get_images: vk::PFN_vkGetSwapchainImagesKHR =
+            unsafe { std::mem::transmute_copy(&get_images) };
+        let mut image_count = 2;
+        let mut images = [vk::Image::null(); 2];
+        assert_eq!(
+            unsafe { get_images(device, swapchain, &mut image_count, images.as_mut_ptr()) },
+            vk::Result::SUCCESS
+        );
+        assert_eq!(image_count, 2);
+        assert_eq!(swapchain::state(swapchain).unwrap().images, images);
+        assert_eq!(SWAPCHAIN_IMAGE_CALLS.load(Ordering::SeqCst), 1);
+
+        ACQUIRE_RESULT.store(vk::Result::SUBOPTIMAL_KHR.as_raw(), Ordering::SeqCst);
+        let acquire = unsafe { vkGetDeviceProcAddr(device, c"vkAcquireNextImageKHR".as_ptr()) }
+            .expect("acquire proc");
+        let acquire: vk::PFN_vkAcquireNextImageKHR = unsafe { std::mem::transmute_copy(&acquire) };
+        let mut image_index = u32::MAX;
+        assert_eq!(
+            unsafe {
+                acquire(
+                    device,
+                    swapchain,
+                    77,
+                    vk::Semaphore::from_raw(0xFA01),
+                    vk::Fence::from_raw(0xFA02),
+                    &mut image_index,
+                )
+            },
+            vk::Result::SUBOPTIMAL_KHR
+        );
+        assert_eq!(image_index, 1);
+        assert!(swapchain::state(swapchain)
+            .unwrap()
+            .acquired_images
+            .contains(&1));
+
+        let mut partial_count = 1;
+        let mut partial_images = [vk::Image::null(); 1];
+        assert_eq!(
+            unsafe {
+                get_images(
+                    device,
+                    swapchain,
+                    &mut partial_count,
+                    partial_images.as_mut_ptr(),
+                )
+            },
+            vk::Result::INCOMPLETE
+        );
+        let state = swapchain::state(swapchain).unwrap();
+        assert_eq!(state.images, images);
+        assert!(state.acquired_images.contains(&1));
+
+        let sentinel = 0x8765usize;
+        let acquire_info = vk::AcquireNextImageInfoKHR::default()
+            .swapchain(swapchain)
+            .timeout(91)
+            .semaphore(vk::Semaphore::from_raw(0xFA03))
+            .fence(vk::Fence::from_raw(0xFA04));
+        let mut acquire_info = acquire_info;
+        acquire_info.p_next = sentinel as *const c_void;
+        ACQUIRE2_RESULT.store(vk::Result::ERROR_OUT_OF_DATE_KHR.as_raw(), Ordering::SeqCst);
+        let acquire2 = unsafe { vkGetDeviceProcAddr(device, c"vkAcquireNextImage2KHR".as_ptr()) }
+            .expect("acquire2 proc");
+        let acquire2: vk::PFN_vkAcquireNextImage2KHR =
+            unsafe { std::mem::transmute_copy(&acquire2) };
+        image_index = u32::MAX;
+        assert_eq!(
+            unsafe { acquire2(device, &acquire_info, &mut image_index) },
+            vk::Result::ERROR_OUT_OF_DATE_KHR
+        );
+        assert_eq!(image_index, 0);
+        assert_eq!(ACQUIRE2_PNEXT.load(Ordering::SeqCst), sentinel);
+        assert!(!swapchain::state(swapchain)
+            .unwrap()
+            .acquired_images
+            .contains(&0));
+
+        let destroy = unsafe { vkGetDeviceProcAddr(device, c"vkDestroySwapchainKHR".as_ptr()) }
+            .expect("destroy proc");
+        let destroy: vk::PFN_vkDestroySwapchainKHR = unsafe { std::mem::transmute_copy(&destroy) };
+        unsafe { destroy(device, swapchain, std::ptr::null()) };
+        assert!(swapchain::state(swapchain).is_none());
+        assert_eq!(SWAPCHAIN_DESTROY_CALLS.load(Ordering::SeqCst), 1);
+        cleanup_swapchain_device(device, queue, instance);
+    }
+
+    #[test]
+    fn batched_present_preserves_pnext_results_and_overall_result() {
+        let _guard = DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (device, queue, surface) = setup_swapchain_device();
+        let instance = vk::Instance::from_raw(0xE101);
+        let info = base_swapchain_create_info(surface);
+        let (_, first) = unsafe { call_create_swapchain(device, &info) };
+        let (_, second) = unsafe { call_create_swapchain(device, &info) };
+        let swapchains = [first, second];
+        let image_indices = [1, 1];
+
+        let get_images =
+            unsafe { vkGetDeviceProcAddr(device, c"vkGetSwapchainImagesKHR".as_ptr()) }
+                .expect("image enumeration proc");
+        let get_images: vk::PFN_vkGetSwapchainImagesKHR =
+            unsafe { std::mem::transmute_copy(&get_images) };
+        for swapchain in swapchains {
+            let mut count = 2;
+            let mut images = [vk::Image::null(); 2];
+            assert_eq!(
+                unsafe { get_images(device, swapchain, &mut count, images.as_mut_ptr()) },
+                vk::Result::SUCCESS
+            );
+        }
+        let acquire = unsafe { vkGetDeviceProcAddr(device, c"vkAcquireNextImageKHR".as_ptr()) }
+            .expect("acquire proc");
+        let acquire: vk::PFN_vkAcquireNextImageKHR = unsafe { std::mem::transmute_copy(&acquire) };
+        for swapchain in swapchains {
+            let mut acquired_index = u32::MAX;
+            assert_eq!(
+                unsafe {
+                    acquire(
+                        device,
+                        swapchain,
+                        u64::MAX,
+                        vk::Semaphore::null(),
+                        vk::Fence::null(),
+                        &mut acquired_index,
+                    )
+                },
+                vk::Result::SUCCESS
+            );
+            assert_eq!(acquired_index, 1);
+        }
+        let waits = [vk::Semaphore::from_raw(0xFB01)];
+        let mut results = [vk::Result::NOT_READY; 2];
+        let sentinel = 0x9876usize;
+        let mut present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&waits)
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+        present_info.p_next = sentinel as *const c_void;
+        present_info.p_results = results.as_mut_ptr();
+        PRESENT_RESULT.store(vk::Result::ERROR_OUT_OF_DATE_KHR.as_raw(), Ordering::SeqCst);
+        PRESENT_SECOND_RESULT.store(vk::Result::ERROR_OUT_OF_DATE_KHR.as_raw(), Ordering::SeqCst);
+
+        let present = unsafe { vkGetDeviceProcAddr(device, c"vkQueuePresentKHR".as_ptr()) }
+            .expect("present proc");
+        let present: vk::PFN_vkQueuePresentKHR = unsafe { std::mem::transmute_copy(&present) };
+        assert_eq!(
+            unsafe { present(queue, &present_info) },
+            vk::Result::ERROR_OUT_OF_DATE_KHR
+        );
+        assert_eq!(PRESENT_PNEXT.load(Ordering::SeqCst), sentinel);
+        assert_eq!(
+            PRESENT_RESULTS.load(Ordering::SeqCst),
+            results.as_mut_ptr() as usize
+        );
+        assert_eq!(
+            results,
+            [vk::Result::SUCCESS, vk::Result::ERROR_OUT_OF_DATE_KHR]
+        );
+        let first_state = swapchain::state(first).unwrap();
+        assert!(first_state.enabled);
+        assert!(!first_state.acquired_images.contains(&1));
+        assert!(first_state.presented_images.contains(&1));
+        assert!(!first_state.uncertain_images.contains(&1));
+        let second_state = swapchain::state(second).unwrap();
+        assert!(!second_state.enabled);
+        assert!(!second_state.acquired_images.contains(&1));
+        assert!(!second_state.presented_images.contains(&1));
+        assert!(second_state.uncertain_images.contains(&1));
+
+        let mut reacquired_index = u32::MAX;
+        assert_eq!(
+            unsafe {
+                acquire(
+                    device,
+                    first,
+                    u64::MAX,
+                    vk::Semaphore::null(),
+                    vk::Fence::null(),
+                    &mut reacquired_index,
+                )
+            },
+            vk::Result::SUCCESS
+        );
+        assert_eq!(reacquired_index, 1);
+        let reacquired_state = swapchain::state(first).unwrap();
+        assert!(reacquired_state.acquired_images.contains(&1));
+        assert!(!reacquired_state.presented_images.contains(&1));
+        assert!(!reacquired_state.uncertain_images.contains(&1));
+        cleanup_swapchain_device(device, queue, instance);
     }
 
     #[test]
