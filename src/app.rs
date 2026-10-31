@@ -1,17 +1,10 @@
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    error::Error,
-    io,
-    os::{fd::AsFd, unix::process::CommandExt},
-    path::PathBuf,
-};
+use std::{error::Error, io, os::fd::AsFd};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::{
-    cli::Cli,
-    controller_tracker::{ControllerEvent, ControllerTracker},
-    gamepad_session::GamepadSession,
+    cli::Cli, controller_tracker::ControllerTracker, game_process::GameProcess,
+    gamepad_session_manager::GamepadSessionManager,
 };
 
 pub(crate) struct App {
@@ -24,70 +17,40 @@ impl App {
     }
 
     pub fn run(&self) {
-        if !self.cli.standalone {
-            if let Err(error) = self.launch_child_process() {
-                eprintln!("Could not start a child process: {error}");
-                return;
-            }
-        }
-
-        if let Err(error) = self.track_controllers() {
-            eprintln!("Controller tracking failed: {error}");
+        if let Err(error) = self.run_event_loop() {
+            eprintln!("Application failed: {error}");
         }
     }
 
-    fn launch_child_process(&self) -> Result<(), Box<dyn Error>> {
-        if !self.cli.standalone {
-            if let Some((executable, args)) = self.cli.command.split_first() {
-                std::process::Command::new(executable)
-                    .args(args)
-                    .process_group(0)
-                    .spawn()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn track_controllers(&self) -> Result<(), Box<dyn Error>> {
+    fn run_event_loop(&self) -> Result<(), Box<dyn Error>> {
         let mut tracker = ControllerTracker::new()?;
-        let mut sessions: HashMap<PathBuf, GamepadSession> = HashMap::new();
+        let mut sessions = GamepadSessionManager::new();
+        sessions.handle_controller_events(tracker.update()?);
+        let mut game = if self.cli.standalone {
+            None
+        } else {
+            Some(GameProcess::launch(&self.cli.command)?)
+        };
 
         loop {
-            for event in tracker.update()? {
-                match event {
-                    ControllerEvent::Connected(path) => {
-                        if let Entry::Vacant(entry) = sessions.entry(path.clone()) {
-                            match GamepadSession::new(&path) {
-                                Ok(session) => {
-                                    entry.insert(session);
-                                    println!("Controller connected: {path:?}");
-                                }
-                                Err(error) => {
-                                    eprintln!("Failed to create session for {path:?}: {error}");
-                                }
-                            }
-                        }
-                    }
-                    ControllerEvent::Disconnected(path) => {
-                        sessions.remove(&path);
-                        println!("Controller disconnected: {path:?}");
-                    }
-                }
-            }
+            let (finished_paths, game_finished) = {
+                let watched = sessions.completion_sockets();
 
-            let finished_paths = {
-                let paths: Vec<PathBuf> = sessions.keys().cloned().collect();
-
-                let mut fds = Vec::with_capacity(paths.len() + 1);
+                let mut fds = Vec::with_capacity(watched.len() + 2);
                 fds.push(PollFd::new(tracker.as_fd(), PollFlags::POLLIN));
 
-                for path in &paths {
+                for (_, socket) in &watched {
+                    fds.push(PollFd::new(socket.as_fd(), PollFlags::POLLIN));
+                }
+
+                let game_index = game.as_ref().map(|game| {
+                    let index = fds.len();
                     fds.push(PollFd::new(
-                        sessions[path].exit_socket().as_fd(),
+                        game.completion_socket().as_fd(),
                         PollFlags::POLLIN,
                     ));
-                }
+                    index
+                });
 
                 loop {
                     match poll(&mut fds, PollTimeout::NONE) {
@@ -104,26 +67,36 @@ impl App {
                 }
 
                 let mut finished_paths = Vec::new();
-                for (path, fd) in paths.iter().zip(fds.iter().skip(1)) {
+                for ((path, _), fd) in watched.iter().zip(fds.iter().skip(1)) {
                     let events = fd.revents().unwrap_or(PollFlags::empty());
 
                     if events.intersects(PollFlags::POLLIN | failure) {
-                        finished_paths.push(path.clone());
+                        finished_paths.push((*path).to_owned());
                     }
                 }
 
-                finished_paths
+                let game_finished = game_index.is_some_and(|index| {
+                    !fds[index]
+                        .revents()
+                        .unwrap_or(PollFlags::empty())
+                        .is_empty()
+                });
+
+                (finished_paths, game_finished)
             };
 
-            for path in finished_paths {
-                if let Some(session) = sessions.remove(&path) {
-                    if let Err(error) = session.finish() {
-                        eprintln!("Controller session failed for {path:?}: {error}");
-                    }
+            if game_finished {
+                if let Some(game) = game.take() {
+                    let status = game.finish()?;
+                    println!("Game exited: {status}");
                 }
+                return Ok(());
             }
 
+            sessions.collect_finished(finished_paths);
+
             tracker.drain_notifications();
+            sessions.handle_controller_events(tracker.update()?);
         }
     }
 }
