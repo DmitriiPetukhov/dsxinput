@@ -5,9 +5,13 @@ use std::{
     thread::JoinHandle,
 };
 
+use evdev::{EventType, SynchronizationCode};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-use crate::{physical_gamepad::PhysicalGamepad, virtual_gamepad::VirtualGamepad};
+use crate::{
+    physical_gamepad::{self, PhysicalGamepad},
+    virtual_gamepad::VirtualGamepad,
+};
 
 pub struct GamepadSession {
     worker: Option<JoinHandle<io::Result<()>>>,
@@ -64,27 +68,71 @@ impl GamepadSession {
     }
 
     fn worker(
-        _physical_gamepad: PhysicalGamepad,
+        mut physical_gamepad: PhysicalGamepad,
         _virtual_gamepad: VirtualGamepad,
         shutdown_receiver: UnixStream,
     ) -> io::Result<()> {
-        let mut fds = [PollFd::new(shutdown_receiver.as_fd(), PollFlags::POLLIN)];
+        let mut events_frame = Vec::new();
 
         loop {
-            match poll(&mut fds, PollTimeout::NONE) {
-                Ok(_) => {
-                    // TODO
+            let (shutdown_events, input_events) = {
+                let mut fds = [
+                    PollFd::new(shutdown_receiver.as_fd(), PollFlags::POLLIN),
+                    PollFd::new(physical_gamepad.as_fd(), PollFlags::POLLIN),
+                ];
+
+                match poll(&mut fds, PollTimeout::NONE) {
+                    Ok(_) => {
+                        // TODO
+                    }
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(error) => {
+                        return Err(io::Error::from_raw_os_error(error as i32));
+                    }
                 }
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(error) => {
-                    return Err(io::Error::from_raw_os_error(error as i32));
-                }
+
+                (
+                    fds[0].revents().unwrap_or(PollFlags::empty()),
+                    fds[1].revents().unwrap_or(PollFlags::empty()),
+                )
+            };
+
+            if !shutdown_events.is_empty() {
+                return Ok(());
             }
 
-            let events = fds[0].revents().unwrap_or(PollFlags::empty());
+            let failure = PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL;
 
-            if !events.is_empty() {
-                return Ok(());
+            if input_events.intersects(failure) {
+                return Err(io::Error::other("Physical gamepad disconnected"));
+            }
+
+            if input_events.contains(PollFlags::POLLIN) {
+                match physical_gamepad.read_events() {
+                    Ok(events) => {
+                        for event in events {
+                            // println!("[{}] {event:?}", physical_gamepad.name());
+
+                            let is_report = event.event_type() == EventType::SYNCHRONIZATION
+                                && event.code() == SynchronizationCode::SYN_REPORT.0;
+
+                            if is_report {
+                                if !events_frame.is_empty() {
+                                    println!("[{}] {events_frame:?}", physical_gamepad.name());
+                                    events_frame.clear();
+                                }
+                            } else {
+                                events_frame.push(event);
+                            }
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
