@@ -1,0 +1,16 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_DSXINPUT_overlay",
+    "type": "GLOBAL",
+    "library_path": "./libdsxinput_overlay.so",
+    "api_version": "1.0.0",
+    "implementation_version": "1",
+    "description": "dsxinput version overlay",
+    "functions": {
+      "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "vkGetDeviceProcAddr",
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    }
+  }
+}

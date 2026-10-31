@@ -1,9 +1,26 @@
-[package]
-name = "dsxinput"
+[workspace]
+members = ["overlay"]
+resolver = "2"
+
+[workspace.package]
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.95"
 license = "MIT"
+
+[workspace.dependencies]
+ash = { version = "0.38", default-features = false, features = ["std"] }
+egui = { version = "0.36", default-features = false, features = ["default_fonts"] }
+egui-ash-renderer = { version = "0.13", default-features = false }
+libc = "0.2"
+
+[package]
+name = "dsxinput"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "DualSense evdev to virtual Xbox-style uinput controller for Fedora"
 
 [dependencies]
-libc = "0.2"
+libc.workspace = true

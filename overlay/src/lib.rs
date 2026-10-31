@@ -1,0 +1,3 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
+//! Vulkan layer implementation for the dsxinput in-game version overlay.
