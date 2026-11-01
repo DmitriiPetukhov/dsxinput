@@ -74,7 +74,7 @@ impl GamepadSession {
     }
 
     /// Translate DualSense evdev events to the declared virtual Xbox layout.
-    /// Physical stick and trigger ranges are assumed to be 0..=255.
+    /// Sticks are already filtered to Xbox values; raw triggers use 0..=255.
     fn map_event(event: &InputEvent) -> Option<InputEvent> {
         let value = match event.event_type() {
             EventType::KEY => match KeyCode(event.code()) {
@@ -108,14 +108,7 @@ impl GamepadSession {
                 AbsoluteAxisCode::ABS_X
                 | AbsoluteAxisCode::ABS_Y
                 | AbsoluteAxisCode::ABS_RX
-                | AbsoluteAxisCode::ABS_RY => {
-                    let raw = event.value().clamp(0, 255);
-                    if raw <= 128 {
-                        (raw - 128) * 32768 / 128
-                    } else {
-                        (raw - 128) * 32767 / 127
-                    }
-                }
+                | AbsoluteAxisCode::ABS_RY => event.value(),
                 AbsoluteAxisCode::ABS_Z | AbsoluteAxisCode::ABS_RZ => event.value().clamp(0, 255),
                 AbsoluteAxisCode::ABS_HAT0X | AbsoluteAxisCode::ABS_HAT0Y => {
                     event.value().clamp(-1, 1)
